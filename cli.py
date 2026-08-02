@@ -64,7 +64,7 @@ def apply_preset(chain: MicChain, name: str) -> None:
     else:
         chain.hum_notch_db = 0.0
     chain.denoise = preset["denoise"]
-    chain.denoiser.strength = preset["denoise_strength"]
+    chain.denoise_strength = preset["denoise_strength"]
     chain.gate.threshold_db = preset["gate_db"]
     chain.compressor.threshold_db = preset["comp_threshold_db"]
     chain.compressor.ratio = preset["comp_ratio"]

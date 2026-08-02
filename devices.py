@@ -121,12 +121,12 @@ class Health:
     @property
     def summary(self) -> str:
         if not self.ok:
-            return f"× {self.detail}"
+            return f"× 使えません（{self.detail}）"
         if self.receives_audio is False:
-            return "△ 開けるが音が来ない（機器側の設定を確認）"
+            return "△ つながるが音が届かない（機器のスイッチや音量を確認）"
         if self.peak_db is not None and self.peak_db < -75:
-            return f"△ 使えるが極端に小さい（ピーク {self.peak_db:.0f} dBFS）"
-        return f"○ {self.detail}"
+            return "△ 音がとても小さい（機器の音量を上げてください）"
+        return "○ 使えます"
 
 
 def check(device: Device, seconds: float = 1.2, timeout: float = 6.0) -> Health:

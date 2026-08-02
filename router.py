@@ -31,42 +31,51 @@ class Resampler:
     線形補間を使う。ダウンサンプル時のみ折り返し防止のローパスを通す。
     """
 
-    def __init__(self, in_rate: int, out_rate: int):
+    def __init__(self, in_rate: int, out_rate: int, channels: int = 1):
         self.in_rate = in_rate
         self.out_rate = out_rate
+        self.channels = max(1, channels)
         self.base_ratio = in_rate / out_rate  # 出力 1 サンプルあたりの入力サンプル数
         self.ratio = self.base_ratio
         self._pos = 0.0
-        self._tail = np.zeros(1, dtype=np.float32)
+        self._tail = np.zeros((1, self.channels), dtype=np.float32)
 
         self._sos = None
         if out_rate < in_rate:
             nyq = 0.5 * in_rate
             cutoff = 0.45 * out_rate
             self._sos = signal.butter(6, cutoff / nyq, btype="low", output="sos")
-            self._zi = signal.sosfilt_zi(self._sos) * 0.0
+            # チャンネルごとに状態を持たせる（混ざると位相が崩れる）
+            base = signal.sosfilt_zi(self._sos)
+            self._zi = np.zeros((base.shape[0], base.shape[1], self.channels))
 
     def process(self, x: np.ndarray) -> np.ndarray:
+        mono_in = x.ndim == 1
+        frames = x.reshape(-1, 1) if mono_in else x
         if self._sos is not None:
-            x, self._zi = signal.sosfilt(self._sos, x, zi=self._zi)
-            x = x.astype(np.float32)
+            frames, self._zi = signal.sosfilt(self._sos, frames, axis=0, zi=self._zi)
+            frames = frames.astype(np.float32)
 
+        y = self._interpolate(frames)
+        return y.reshape(-1) if mono_in else y
+
+    def _interpolate(self, x: np.ndarray) -> np.ndarray:
         buf = np.concatenate([self._tail, x])
         # buf[0] は前回の最後のサンプル。読み出し位置は self._pos から始まる
         available = len(buf) - 1
+        empty = np.zeros((0, buf.shape[1]), dtype=np.float32)
         if available <= 0:
             self._tail = buf[-1:]
-            return np.zeros(0, dtype=np.float32)
+            return empty
 
         n_out = int(np.floor((available - self._pos) / self.ratio))
         if n_out <= 0:
             self._tail = buf[-1:] if len(buf) else self._tail
-            self._pos = max(0.0, self._pos - (len(buf) - 1))
-            return np.zeros(0, dtype=np.float32)
+            return empty
 
         idx = self._pos + self.ratio * np.arange(n_out)
         base = idx.astype(np.int64)
-        frac = (idx - base).astype(np.float32)
+        frac = (idx - base).astype(np.float32)[:, None]  # チャンネル方向へ広げる
         y = buf[base] * (1.0 - frac) + buf[base + 1] * frac
 
         consumed = self._pos + self.ratio * n_out
@@ -79,10 +88,14 @@ class Resampler:
 
 
 class RingBuffer:
-    """単一の生産者と単一の消費者を想定した float32 のリングバッファ。"""
+    """単一の生産者と単一の消費者を想定した float32 のリングバッファ。
 
-    def __init__(self, capacity: int, target: int = 0):
-        self._buf = np.zeros(capacity, dtype=np.float32)
+    長さはフレーム数（チャンネルをまたいだ 1 時点ぶん）で数える。
+    """
+
+    def __init__(self, capacity: int, target: int = 0, channels: int = 1):
+        self.channels = max(1, channels)
+        self._buf = np.zeros((capacity, self.channels), dtype=np.float32)
         self._capacity = capacity
         self._read = 0
         self._write = 0
@@ -106,9 +119,14 @@ class RingBuffer:
         return self._capacity
 
     def write(self, data: np.ndarray) -> None:
+        if data.ndim == 1:  # 1 チャンネルなら 1 次元で渡せる
+            data = data.reshape(-1, 1)
         n = len(data)
         if n == 0:
             return
+        if data.shape[1] != self.channels:
+            raise ValueError(
+                f"チャンネル数が違います（{data.shape[1]} / 期待 {self.channels}）")
         with self._lock:
             if self._fill + n > self.max_fill:
                 # 溜まりすぎたら目標量まで一気に捨てて、遅延をその場で戻す。
@@ -126,7 +144,7 @@ class RingBuffer:
             self._fill += n
 
     def read(self, n: int) -> np.ndarray:
-        out = np.zeros(n, dtype=np.float32)
+        out = np.zeros((n, self.channels), dtype=np.float32)
         with self._lock:
             take = min(n, self._fill)
             if take < n:
@@ -153,6 +171,12 @@ class Router:
     def __init__(self, chain=None, on_state=None):
         self.chain = chain          # mic_chain.MicChain（None なら素通し）
         self.on_state = on_state    # (state:str, message:str) を受け取るコールバック
+        # 入力の使い方。1 なら 1 本、2 ならステレオのまま扱う。
+        # offset は「オーディオインターフェースの 2 本目に挿した」場合などに使う。
+        self.in_channels = 1
+        self.in_channel_offset = 0
+        self.mic_gain = 1.0
+        self.muted = False
 
         self.state = "stopped"      # stopped / opening / running / error
         self.message = ""
@@ -161,6 +185,8 @@ class Router:
         self.in_rate = 0
         self.out_rate = 0
         self.out_channels = 1
+        self._active_channels = 1
+        self._slice = slice(0, 1)
         self.in_peak = 0.0
         self.out_peak = 0.0
         self.output_gain = 1.0
@@ -211,9 +237,14 @@ class Router:
 
     # ---------- 開始 / 停止 ----------
     def start(self, in_device: int, out_device: int, latency: str = "low",
-              blocksize: int = 0, buffer_ms: float = 40.0) -> None:
+              blocksize: int = 0, buffer_ms: float = 40.0,
+              in_channels: int | None = None, in_channel_offset: int | None = None) -> None:
         """再生を開始する。実際の open は別スレッドで行い、この呼び出しは即座に戻る。"""
         self.stop()
+        if in_channels is not None:
+            self.in_channels = max(1, min(2, int(in_channels)))
+        if in_channel_offset is not None:
+            self.in_channel_offset = max(0, int(in_channel_offset))
         self._generation += 1
         generation = self._generation
         self._set_state("opening", "デバイスを開いています…")
@@ -252,15 +283,27 @@ class Router:
             out_rate = int(out_info["default_samplerate"])
             out_channels = min(2, max(1, out_info["max_output_channels"]))
 
+            # 使いたいチャンネルまで開く必要がある（2 本目を使うなら 2ch 開く）
+            wanted = self.in_channel_offset + self.in_channels
+            open_channels = min(max(1, in_info["max_input_channels"]), wanted)
+            channels = min(self.in_channels, open_channels - self.in_channel_offset)
+            if channels < 1:  # 指定した本数が無いデバイスだった
+                self.in_channel_offset = 0
+                open_channels = min(max(1, in_info["max_input_channels"]), self.in_channels)
+                channels = max(1, open_channels)
+
             target_fill = int(out_rate * buffer_ms / 1000.0)
-            ring = RingBuffer(int(out_rate * 2.0), target=target_fill)  # 最大 2 秒
-            resampler = Resampler(in_rate, out_rate) if in_rate != out_rate else None
+            ring = RingBuffer(int(out_rate * 2.0), target=target_fill,
+                              channels=channels)  # 最大 2 秒
+            resampler = (Resampler(in_rate, out_rate, channels)
+                         if in_rate != out_rate else None)
 
             in_stream = out_stream = None
             try:
                 in_stream = sd.InputStream(
-                    device=in_device, samplerate=in_rate, channels=1, dtype="float32",
-                    latency=latency, blocksize=blocksize, callback=self._input_callback,
+                    device=in_device, samplerate=in_rate, channels=open_channels,
+                    dtype="float32", latency=latency, blocksize=blocksize,
+                    callback=self._input_callback,
                 )
                 out_stream = sd.OutputStream(
                     device=out_device, samplerate=out_rate, channels=out_channels,
@@ -286,11 +329,15 @@ class Router:
                 self.in_device, self.out_device = in_device, out_device
                 self.in_rate, self.out_rate = in_rate, out_rate
                 self.out_channels = out_channels
+                self._active_channels = channels
+                self._slice = slice(self.in_channel_offset,
+                                    self.in_channel_offset + channels)
                 self._ring, self._resampler = ring, resampler
                 self._target_fill = target_fill
                 self._in_stream, self._out_stream = in_stream, out_stream
             if self.chain is not None and hasattr(self.chain, "set_rate"):
                 self.chain.set_rate(in_rate)
+                self.chain.set_channels(channels)
 
             out_stream.start()
             in_stream.start()
@@ -343,7 +390,7 @@ class Router:
 
     # ---------- コールバック ----------
     def _input_callback(self, indata, frames, time_info, status) -> None:
-        x = indata[:, 0]
+        x = indata[:, self._slice]  # 使うチャンネルだけ取り出す
         self.in_peak = float(np.abs(x).max()) if frames else 0.0
         if self.chain is not None:
             x = self.chain.process(x)
@@ -386,14 +433,19 @@ class Router:
             outdata.fill(0)
             self.out_peak = 0.0
             return
-        mono = ring.read(frames)
-        if self.output_gain != 1.0:
-            mono = mono * self.output_gain
-        self.out_peak = float(np.abs(mono).max()) if frames else 0.0
-        if self.out_channels == 1:
-            outdata[:, 0] = mono
-        else:
-            outdata[:] = mono[:, None]
+        block = ring.read(frames)  # (フレーム, チャンネル)
+        gain = 0.0 if self.muted else self.output_gain * self.mic_gain
+        if gain != 1.0:
+            block = block * gain
+        self.out_peak = float(np.abs(block).max()) if frames else 0.0
+
+        got = block.shape[1]
+        if got == self.out_channels:
+            outdata[:] = block
+        elif got == 1:  # モノラルを両方へ配る
+            outdata[:] = block[:, :1]
+        else:  # ステレオをモノラル出力へまとめる
+            outdata[:, 0] = block.mean(axis=1)
 
 
 def probe_device(device: int, kind: str, timeout: float = 5.0) -> tuple[bool, str]:

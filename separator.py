@@ -249,7 +249,7 @@ def _load_model(name: str, device: str):
     return model
 
 
-def _decode(path: str, rate: int, channels: int) -> np.ndarray:
+def decode_audio(path: str, rate: int, channels: int) -> np.ndarray:
     """音声を (チャンネル, サンプル) の float32 で読み出す。"""
     layout = "stereo" if channels == 2 else "mono"
     blocks = []
@@ -268,7 +268,7 @@ def _decode(path: str, rate: int, channels: int) -> np.ndarray:
     return np.concatenate(blocks).T.astype(np.float32)
 
 
-def _write_wav(path: str, audio: np.ndarray, rate: int) -> None:
+def write_wav(path: str, audio: np.ndarray, rate: int) -> None:
     """(チャンネル, サンプル) の float32 を 16bit WAV で書き出す。"""
     data = np.clip(audio.T, -1.0, 1.0)
     pcm = (data * 32767.0).astype(np.int16)
@@ -319,7 +319,7 @@ def separate(source: str, progress=None, keep_vocals: bool = False,
 
     if progress:
         progress("音声を読み込み中", 0.15)
-    wav = _decode(source, model.samplerate, model.audio_channels)
+    wav = decode_audio(source, model.samplerate, model.audio_channels)
 
     tensor = torch.from_numpy(wav)
     reference = tensor.mean(0)
@@ -347,7 +347,7 @@ def separate(source: str, progress=None, keep_vocals: bool = False,
 
     if progress:
         progress("書き出し中", 0.9)
-    _write_wav(output, result.cpu().numpy(), model.samplerate)
+    write_wav(output, result.cpu().numpy(), model.samplerate)
 
     del sources, tensor
     torch.cuda.empty_cache()

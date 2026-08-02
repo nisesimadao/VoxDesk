@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -39,6 +40,7 @@ import numpy as np
 import sounddevice as sd
 from PIL import ImageTk
 
+import applog
 import config
 import devices as dev
 import mic_chain
@@ -49,6 +51,7 @@ from player import AVPlayer
 from router import Router
 
 APP_TITLE = "VoxDesk"
+LOG = applog.get(__name__)
 
 PRESETS = {
     "カラオケマイク（有線・直挿し）": dict(
@@ -77,6 +80,19 @@ PRESETS = {
 # ノイズ除去の強さ。0 で無効、負の値はマイク側（RTX Voice など）に任せる印
 AI_MIC_MODE = "マイク側で処理（RTX Voice / Krisp など）"
 RNNOISE_MODE = "AI（RNNoise・話し声向け）"
+# 「low / high」のままだと何のことか分からないので、日本語で選ばせる
+LATENCY_MODES = {
+    "少なめ（おすすめ）": "low",
+    "多め（途切れるとき）": "high",
+}
+
+# 入力の使い方。(チャンネル数, 何本目から使うか)
+INPUT_MODES = {
+    "モノラル（1 本目）": (1, 0),
+    "モノラル（2 本目）": (1, 1),
+    "ステレオ（1・2 本目）": (2, 0),
+}
+
 DENOISE_MODES = {
     "なし": 0.0,
     "弱め": 0.8,
@@ -85,6 +101,33 @@ DENOISE_MODES = {
     RNNOISE_MODE: -2.0,
     AI_MIC_MODE: -1.0,
 }
+
+
+def friendly_error(error: Exception) -> str:
+    """英語の例外を、そのまま見せずに日本語の一言にする。"""
+    text = str(error)
+    lowered = text.lower()
+    patterns = [
+        ("sign in to confirm", "YouTube 側で確認を求められました。少し時間をおいて試してください。"),
+        ("video unavailable", "この動画は再生できません。別の曲を選んでください。"),
+        ("private video", "この動画は非公開です。別の曲を選んでください。"),
+        ("age", "年齢確認が必要な動画のため再生できません。"),
+        ("urlopen error", "ネットにつながっていないようです。接続を確認してください。"),
+        ("getaddrinfo", "ネットにつながっていないようです。接続を確認してください。"),
+        ("timed out", "接続に時間がかかりすぎました。もう一度試してください。"),
+        ("timeout", "接続に時間がかかりすぎました。もう一度試してください。"),
+        ("http error 429", "アクセスが多すぎます。少し待ってから試してください。"),
+        ("no such file", "ファイルが見つかりませんでした。"),
+        ("permission", "ファイルを開く権限がありません。"),
+        ("unable to download", "音源を取得できませんでした。別の曲を試してください。"),
+        ("unsupported url", "この URL には対応していません。"),
+    ]
+    for needle, message in patterns:
+        if needle in lowered:
+            return message
+    if len(text) > 120:  # 長い英文をそのまま出しても読めない
+        return "うまくいきませんでした。別の曲や設定で試してみてください。"
+    return text
 
 
 def resource_path(*parts: str) -> str:
@@ -113,8 +156,13 @@ class KaraokeApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("1080x760")
-        self.minsize(900, 620)
+        # 画面に収まる大きさで開く。1366x768 のノートでも
+        # 下の再生ボタンが画面外に出ないようにする。
+        screen_w, screen_h = self.winfo_screenwidth(), self.winfo_screenheight()
+        width = min(1080, max(820, screen_w - 120))
+        height = min(760, max(560, screen_h - 160))
+        self.geometry(f"{width}x{height}")
+        self.minsize(820, 560)
 
         self.cfg = config.load()
         self.ui_queue: queue.Queue = queue.Queue()
@@ -128,11 +176,13 @@ class KaraokeApp(tk.Tk):
         self.tracks: list[music_search.Track] = []
         self.current_track: music_search.Track | None = None
         self.current_local_path: str | None = None  # ローカル再生中のファイル
+        self.current_lyrics = None
         self.separator_capability = None
         self.editors: dict[int, dict] = {}  # 開いているプラグイン画面（別プロセス）
         self._photo: ImageTk.PhotoImage | None = None
         self._seeking = False
         self._transport_state = ""  # 表示を実際の再生状態に追従させるために覚えておく
+        self._last_xruns = 0
         self._busy = 0
 
         self._set_icon()
@@ -211,6 +261,7 @@ class KaraokeApp(tk.Tk):
         search.grid(row=0, column=0, sticky="ew")
         search.columnconfigure(1, weight=1)
         ttk.Label(search, text="曲を探す", style="Head.TLabel").grid(row=0, column=0, padx=(0, 8))
+        # 曲名でも、YouTube の URL を貼っても同じ欄で受ける
         self.query_var = tk.StringVar()
         entry = ttk.Entry(search, textvariable=self.query_var, font=(self.ui_family, 11))
         entry.grid(row=0, column=1, sticky="ew")
@@ -226,6 +277,8 @@ class KaraokeApp(tk.Tk):
 
         extra = ttk.Frame(tab)
         extra.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        ttk.Button(extra, text="ランキングから選ぶ", command=self.show_ranking).pack(
+            side="left", padx=(0, 6))
         ttk.Button(extra, text="ファイルを開く", command=self.open_local_file).pack(side="left")
         ttk.Button(extra, text="音源の入手先", command=self.show_sources).pack(
             side="left", padx=6)
@@ -234,6 +287,16 @@ class KaraokeApp(tk.Tk):
         self.vocal_button.pack(side="left", padx=(6, 0))
         self.vocal_hint = ttk.Label(extra, text="（対応環境を確認中…）", style="Hint.TLabel")
         self.vocal_hint.pack(side="left", padx=6)
+
+        lyric_row = ttk.Frame(tab)
+        lyric_row.grid(row=1, column=0, columnspan=2, sticky="e", pady=(6, 0))
+        self.show_lyrics_var = tk.BooleanVar(value=self.cfg.get("show_lyrics", True))
+        ttk.Checkbutton(lyric_row, text="歌詞を出す", variable=self.show_lyrics_var,
+                        command=self._on_lyrics_toggle).pack(side="left")
+        ttk.Button(lyric_row, text="曲を指定", command=self.choose_lyrics).pack(
+            side="left", padx=6)
+        self.lyric_status = ttk.Label(lyric_row, text="", style="Hint.TLabel")
+        self.lyric_status.pack(side="left")
 
         columns = ("score", "time", "title", "channel")
         self.result_tree = ttk.Treeview(tab, columns=columns, show="headings", height=7)
@@ -259,8 +322,19 @@ class KaraokeApp(tk.Tk):
         self.video_label.bind("<Configure>", self._on_video_resize)
         self.video_label.bind("<Double-1>", lambda _e: self.toggle_play())
 
+        lyric_box = tk.Frame(tab, bg="#101014")
+        lyric_box.grid(row=4, column=0, columnspan=2, sticky="ew")
+        self.lyric_now = tk.Label(lyric_box, text="", bg="#101014", fg="#f2f4f8",
+                                  font=(self.ui_family, 16, "bold"), anchor="center")
+        self.lyric_now.pack(fill="x", pady=(6, 0))
+        self.lyric_next = tk.Label(lyric_box, text="", bg="#101014", fg="#8a90a0",
+                                   font=(self.ui_family, 11), anchor="center")
+        self.lyric_next.pack(fill="x", pady=(0, 6))
+        self.lyric_box = lyric_box
+        lyric_box.grid_remove()  # 歌詞が取れたときだけ出す
+
         controls = ttk.Frame(tab)
-        controls.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        controls.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         controls.columnconfigure(3, weight=1)
         self.play_button = ttk.Button(controls, text="▶ 再生", width=12,
                                       command=self.toggle_play, style="Big.TButton")
@@ -275,16 +349,29 @@ class KaraokeApp(tk.Tk):
         self.seek_scale.bind("<ButtonPress-1>", lambda _e: setattr(self, "_seeking", True))
         self.seek_scale.bind("<ButtonRelease-1>", self._on_seek_release)
 
-        ttk.Label(controls, text="伴奏").grid(row=0, column=4, padx=(8, 2))
+        key = ttk.Frame(controls)
+        key.grid(row=0, column=4, padx=(10, 6))
+        ttk.Label(key, text="キー").pack(side="left", padx=(0, 4))
+        ttk.Button(key, text="♭", width=3,
+                   command=lambda: self.change_key(-1)).pack(side="left")
+        saved_key = int(self.cfg.get("pitch_semitones", 0))
+        self.player.semitones = float(saved_key)
+        self.key_label = ttk.Label(key, text=f"{saved_key:+d}" if saved_key else "±0",
+                                   width=4, anchor="center")
+        self.key_label.pack(side="left")
+        ttk.Button(key, text="♯", width=3,
+                   command=lambda: self.change_key(1)).pack(side="left")
+
+        ttk.Label(controls, text="伴奏").grid(row=0, column=5, padx=(8, 2))
         self.music_volume_var = tk.DoubleVar(value=self.cfg.get("music_volume", 0.8))
         ttk.Scale(controls, from_=0.0, to=1.5, variable=self.music_volume_var, length=110,
                   command=lambda _v: setattr(self.player, "volume",
-                                             self.music_volume_var.get())).grid(row=0, column=5)
+                                             self.music_volume_var.get())).grid(row=0, column=6)
         self.player.volume = self.music_volume_var.get()
 
         self.music_status = ttk.Label(tab, text="曲名やアーティスト名で検索してください。",
                                       style="Hint.TLabel")
-        self.music_status.grid(row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.music_status.grid(row=6, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
     # ---------- マイクタブ ----------
     def _build_mic_tab(self) -> None:
@@ -311,8 +398,16 @@ class KaraokeApp(tk.Tk):
         ttk.Button(box, text="テスト", width=8,
                    command=lambda: self.test_device("output")).grid(row=1, column=2, pady=3)
 
+        ttk.Label(box, text="入力の使い方").grid(row=2, column=0, sticky="w", pady=3)
+        self.input_mode_var = tk.StringVar(
+            value=self.cfg.get("input_mode", list(INPUT_MODES)[0]))
+        mode = ttk.Combobox(box, textvariable=self.input_mode_var,
+                            values=list(INPUT_MODES), state="readonly", width=26)
+        mode.grid(row=2, column=1, sticky="w", padx=6, pady=3)
+        mode.bind("<<ComboboxSelected>>", lambda _e: self._on_device_change())
+
         ttk.Label(box, text="※ 伴奏もこの出力先から鳴ります", style="Hint.TLabel").grid(
-            row=2, column=1, sticky="w", padx=6)
+            row=3, column=1, sticky="w", padx=6)
 
         action = ttk.Frame(tab)
         action.grid(row=1, column=0, sticky="ew", pady=10)
@@ -325,8 +420,23 @@ class KaraokeApp(tk.Tk):
         self.router_note = ttk.Label(action, text="", style="Hint.TLabel")
         self.router_note.grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
+        fader = ttk.LabelFrame(tab, text=" マイクの音量 ", padding=10)
+        fader.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        fader.columnconfigure(1, weight=1)
+        self.mute_var = tk.BooleanVar(value=False)
+        self.mute_button = ttk.Checkbutton(
+            fader, text="ミュート", variable=self.mute_var, command=self._on_mute)
+        self.mute_button.grid(row=0, column=0, padx=(0, 8))
+        self.mic_volume_var = tk.DoubleVar(value=float(self.cfg.get("mic_volume", 1.0)))
+        ttk.Scale(fader, from_=0.0, to=2.0, variable=self.mic_volume_var,
+                  command=lambda _v: self._on_mic_volume()).grid(
+            row=0, column=1, sticky="ew", padx=6)
+        self.mic_volume_label = ttk.Label(fader, text="100%", width=6)
+        self.mic_volume_label.grid(row=0, column=2)
+        self._on_mic_volume()
+
         meters = ttk.LabelFrame(tab, text=" レベル ", padding=10)
-        meters.grid(row=2, column=0, sticky="ew")
+        meters.grid(row=3, column=0, sticky="ew")
         meters.columnconfigure(1, weight=1)
         ttk.Label(meters, text="入力").grid(row=0, column=0, sticky="w")
         self.in_meter = ttk.Progressbar(meters, maximum=100)
@@ -338,9 +448,11 @@ class KaraokeApp(tk.Tk):
         self.out_meter.grid(row=1, column=1, sticky="ew", padx=8, pady=3)
         self.out_db_label = ttk.Label(meters, text="--- dB", width=9)
         self.out_db_label.grid(row=1, column=2)
+        self.quality_label = ttk.Label(meters, text="", style="Hint.TLabel")
+        self.quality_label.grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
         fx = ttk.LabelFrame(tab, text=" 音の調整 ", padding=10)
-        fx.grid(row=3, column=0, sticky="ew", pady=10)
+        fx.grid(row=4, column=0, sticky="ew", pady=10)
         fx.columnconfigure(1, weight=1)
 
         ttk.Label(fx, text="プリセット").grid(row=0, column=0, sticky="w")
@@ -410,14 +522,17 @@ class KaraokeApp(tk.Tk):
         ttk.Label(audio, text=platform_support.host_api_hint(),
                   style="Hint.TLabel").grid(row=1, column=1, sticky="w", padx=8)
 
-        ttk.Label(audio, text="遅延").grid(row=2, column=0, sticky="w", pady=3)
-        self.latency_var = tk.StringVar(value=self.cfg.get("latency", "low"))
-        lat = ttk.Combobox(audio, textvariable=self.latency_var, values=["low", "high"],
-                           state="readonly", width=8)
+        ttk.Label(audio, text="声の遅れ").grid(row=2, column=0, sticky="w", pady=3)
+        saved_latency = self.cfg.get("latency", "low")
+        self.latency_var = tk.StringVar(
+            value=next((k for k, v in LATENCY_MODES.items() if v == saved_latency),
+                       list(LATENCY_MODES)[0]))
+        lat = ttk.Combobox(audio, textvariable=self.latency_var,
+                           values=list(LATENCY_MODES), state="readonly", width=22)
         lat.grid(row=2, column=1, sticky="w", padx=8, pady=3)
         lat.bind("<<ComboboxSelected>>", lambda _e: self._on_device_change())
 
-        ttk.Label(audio, text="バッファ").grid(row=3, column=0, sticky="w", pady=3)
+        ttk.Label(audio, text="音の安定").grid(row=3, column=0, sticky="w", pady=3)
         self.buffer_var = tk.DoubleVar(value=self.cfg.get("buffer_ms", 40.0))
         buffer_label = ttk.Label(audio, text="")
         ttk.Scale(audio, from_=10, to=200, variable=self.buffer_var, length=240,
@@ -426,15 +541,17 @@ class KaraokeApp(tk.Tk):
             row=3, column=1, sticky="w", padx=8)
         buffer_label.grid(row=3, column=2)
         buffer_label.configure(text=f"{self.buffer_var.get():.0f} ms")
-        ttk.Label(audio, text="音が途切れるときは大きくする（遅延は増えます）",
+        ttk.Label(audio, text="音が途切れるときは右へ。声の遅れは少し増えます",
                   style="Hint.TLabel").grid(row=4, column=1, sticky="w", padx=8)
 
         diag = ttk.Frame(tab)
         diag.grid(row=1, column=0, sticky="ew", pady=(12, 4))
-        ttk.Label(diag, text="デバイス診断", style="Head.TLabel").pack(side="left")
+        ttk.Label(diag, text="機器の状態", style="Head.TLabel").pack(side="left")
         ttk.Button(diag, text="すべて調べる", command=self.run_diagnostics).pack(
             side="left", padx=8)
         ttk.Button(diag, text="機器を再検出", command=self.rescan_devices).pack(side="left")
+        ttk.Button(diag, text="選んだものを使う", command=self.use_diagnosed_device).pack(
+            side="left", padx=8)
 
         columns = ("kind", "device", "result", "hint")
         self.diag_tree = ttk.Treeview(tab, columns=columns, show="headings", height=8)
@@ -578,8 +695,11 @@ class KaraokeApp(tk.Tk):
             if self._busy == 0:
                 self.status_label.configure(text="準備完了")
         if error is not None:
-            self.status_label.configure(text=f"失敗: {error}")
-            messagebox.showerror(APP_TITLE, str(error))
+            # 画面には短い日本語を出しつつ、本当の中身は記録に残す
+            LOG.error("処理に失敗しました", exc_info=(type(error), error, error.__traceback__))
+            message = friendly_error(error)
+            self.status_label.configure(text=message)
+            messagebox.showerror(APP_TITLE, message)
             return
         if done:
             done(result)
@@ -672,6 +792,27 @@ class KaraokeApp(tk.Tk):
         self.diag_tree.delete(*self.diag_tree.get_children())
         self.run_async(work, self._show_diagnostics, busy_text="デバイスを診断中…（少し待ってください）")
 
+    def use_diagnosed_device(self) -> None:
+        """診断の表で選んだ機器を、そのまま設定に反映する。
+
+        表を見せるだけでは「で、どれを選べば？」となるので、ここで繋ぐ。
+        """
+        selection = self.diag_tree.selection()
+        if not selection:
+            messagebox.showinfo(APP_TITLE, "表から使いたい機器を選んでから押してください。")
+            return
+        kind, label, *_ = self.diag_tree.item(selection[0])["values"]
+        name = str(label).split(" [")[0]
+        pool = self.mic_devices if kind == "入力" else self.out_devices
+        target = next((d for d in pool if d.name == name), None)
+        if target is None:
+            messagebox.showinfo(APP_TITLE, "この機器はいま選べません。「機器を再検出」を試してください。")
+            return
+        (self.mic_var if kind == "入力" else self.out_var).set(target.label)
+        self._on_device_change()
+        self.status_label.configure(text=f"{kind}を「{target.name}」にしました")
+        self.notebook.select(1)
+
     def _show_diagnostics(self, rows) -> None:
         self.diag_tree.delete(*self.diag_tree.get_children())
         for device, health, hint in rows:
@@ -717,13 +858,27 @@ class KaraokeApp(tk.Tk):
         if mic and ("USB" in mic.name.upper() or "Headset" in mic.name):
             self.preset_var.set("USBマイク・ヘッドセット")
             self.apply_preset()
-        message = []
-        message.append(f"マイク: {mic.name}" if mic else "音が来ているマイクが見つかりませんでした")
-        message.append(f"出力先: {out.name}" if out else "使える出力先が見つかりませんでした")
+
         if not mic:
-            message += ["", "マイクが挿さっているか、機器側のスイッチと録音レベルを確認してください。",
-                        "「設定・診断」タブの「すべて調べる」で状況を一覧できます。"]
-        messagebox.showinfo(APP_TITLE, "\n".join(message))
+            messagebox.showinfo(
+                APP_TITLE,
+                "音が来ているマイクが見つかりませんでした。\n\n"
+                "・マイクが挿さっているか\n"
+                "・機器側のスイッチと録音レベル\n"
+                "を確認してから、もう一度「自動設定」を押してください。\n\n"
+                "「設定・診断」タブの「すべて調べる」で、機器ごとの状況を一覧できます。")
+            return
+
+        # 見つけただけで終わると「次に何をすればいいか」が分からないので、そのまま繋ぐ
+        if messagebox.askyesno(
+            APP_TITLE,
+            f"マイク: {mic.name}\n"
+            f"出力先: {out.name if out else '（見つかりません）'}\n\n"
+            "この組み合わせでマイクを入れますか？\n"
+            "（入れたあと、カラオケタブで曲を探して歌えます）",
+        ):
+            self.start_mic()
+            self.after(1500, lambda: self.notebook.select(0))
 
     def _first_run(self) -> None:
         self.cfg["first_run"] = False
@@ -751,20 +906,76 @@ class KaraokeApp(tk.Tk):
         else:
             self.start_mic()
 
+    # スピーカーから音を出すと、その音をマイクが拾って回り込む（ハウリング）。
+    # 名前で見分けられる範囲だけでも先に警告する。
+    SPEAKER_WORDS = ("スピーカー", "speaker", "内蔵", "built-in", "realtek", "モニター",
+                     "monitor", "display", "hdmi")
+    HEADPHONE_WORDS = ("ヘッドホン", "ヘッドセット", "headphone", "headset", "earphone",
+                       "イヤホン", "airpods", "buds")
+
+    def _howling_risk(self, out_device) -> bool:
+        name = out_device.name.lower()
+        if any(word in name for word in self.HEADPHONE_WORDS):
+            return False
+        return any(word.lower() in name for word in self.SPEAKER_WORDS)
+
     def start_mic(self) -> None:
         mic, out = self.selected_device("input"), self.selected_device("output")
         if mic is None or out is None:
             messagebox.showwarning(APP_TITLE, "マイクと出力先を選んでください。")
             return
+
+        if self._howling_risk(out) and not self.cfg.get("howling_ok"):
+            if not messagebox.askyesno(
+                APP_TITLE,
+                f"出力先が「{out.name}」になっています。\n\n"
+                "スピーカーから出すと、その音をマイクが拾って\n"
+                "「キーン」という大きな音（ハウリング）が出ることがあります。\n\n"
+                "イヤホンかヘッドホンを使うことをおすすめします。\n"
+                "このまま続けますか？",
+            ):
+                return
+            self.cfg["howling_ok"] = True  # 一度確認したら次から聞かない
         # 先に止めてから作り直す。動いているコールバックの裏で
         # ノイズ除去器やプラグインの状態を差し替えると壊れる
         self.router.stop()
         self.chain.set_rate(mic.rate)
+        self.router.mic_gain = float(self.mic_volume_var.get())
+        self.router.muted = bool(self.mute_var.get())
+        channels, offset = INPUT_MODES.get(self.input_mode_var.get(), (1, 0))
+        self.cfg["input_mode"] = self.input_mode_var.get()
         self.router.start(
             mic.index, out.index,
-            latency=self.latency_var.get(),
+            latency=LATENCY_MODES.get(self.latency_var.get(), "low"),
             buffer_ms=float(self.buffer_var.get()),
+            in_channels=channels, in_channel_offset=offset,
         )
+
+    def _update_quality_label(self) -> None:
+        """遅延と途切れ回数を出す。途切れが増えたら直し方も添える。"""
+        over, under = self.router.xruns
+        total = over + under
+        channels = "ステレオ" if getattr(self.router, "_active_channels", 1) > 1 else "モノラル"
+        text = (f"遅延 {self.router.latency_ms:.0f} ms（声が返ってくるまで）"
+                f" / {channels} / 途切れ {total} 回")
+        if total > self._last_xruns and total > 3:
+            text += " ← 「設定・診断」でバッファを大きくすると直ります"
+            self.quality_label.configure(foreground="#b00")
+        else:
+            self.quality_label.configure(foreground="#666")
+        self._last_xruns = total
+        self.quality_label.configure(text=text)
+
+    def _on_mic_volume(self) -> None:
+        value = float(self.mic_volume_var.get())
+        self.cfg["mic_volume"] = value
+        self.router.mic_gain = value
+        self.mic_volume_label.configure(text=f"{value*100:.0f}%")
+
+    def _on_mute(self) -> None:
+        self.router.muted = bool(self.mute_var.get())
+        self.status_label.configure(
+            text="マイクをミュートしました" if self.router.muted else "ミュートを解除しました")
 
     def stop_mic(self) -> None:
         self.router.stop()
@@ -794,7 +1005,7 @@ class KaraokeApp(tk.Tk):
         self.chain.set_hum_base(fx["hum_hz"] or 50.0)
         self.chain.hum_notch_db = fx["hum_notch_db"] if fx["hum_hz"] else 0.0
         self.chain.denoise = fx["denoise"]
-        self.chain.denoiser.strength = fx["denoise_strength"]
+        self.chain.denoise_strength = fx["denoise_strength"]
         self.chain.gate.threshold_db = fx["gate_db"]
         self.chain.compressor.threshold_db = fx["comp_threshold_db"]
         self.chain.compressor.ratio = fx["comp_ratio"]
@@ -809,7 +1020,7 @@ class KaraokeApp(tk.Tk):
         if key == "input_gain_db":
             self.chain.input_gain.gain_db = value
         elif key == "denoise_strength":
-            self.chain.denoiser.strength = value
+            self.chain.denoise_strength = value
         elif key == "gate_db":
             self.chain.gate.threshold_db = value
         elif key == "comp_ratio":
@@ -836,7 +1047,7 @@ class KaraokeApp(tk.Tk):
             self.chain.set_denoise_engine("spectral")
             self.chain.denoise = strength > 0
             if strength > 0:
-                self.chain.denoiser.strength = strength
+                self.chain.denoise_strength = strength
                 self.cfg["effects"]["denoise_strength"] = strength
         self.cfg["effects"]["denoise"] = self.chain.denoise
 
@@ -900,7 +1111,7 @@ class KaraokeApp(tk.Tk):
             if current != AI_MIC_MODE:
                 self.denoise_mode_var.set("なし")
             return
-        strength = self.chain.denoiser.strength
+        strength = self.chain.denoise_strength
         best = min((m for m in DENOISE_MODES if DENOISE_MODES[m] > 0),
                    key=lambda m: abs(DENOISE_MODES[m] - strength))
         self.denoise_mode_var.set(best)
@@ -1321,9 +1532,17 @@ class KaraokeApp(tk.Tk):
                 continue
 
     # ================= 音楽 =================
+    # 検索欄に貼られたものが URL かどうかを見分ける
+    URL_PATTERN = re.compile(r"https?://\S+", re.I)
+
     def search(self) -> None:
         query = self.query_var.get().strip()
         if not query:
+            return
+
+        url = self.URL_PATTERN.match(query)
+        if url:  # URL を貼られたら、そのまま再生する
+            self.play_url(query)
             return
         self.cfg["prefer_off_vocal"] = self.offvocal_var.get()
         self.cfg["trusted_only"] = self.trusted_var.get()
@@ -1540,12 +1759,241 @@ class KaraokeApp(tk.Tk):
     def _play_separated(self, path: str) -> None:
         out = self.selected_device("output")
         self.current_local_path = path
+        if int(self.cfg.get("pitch_semitones", 0)):
+            self.apply_key_to_current()
+            return
         self._photo = None
         self.player.open(path, None, {}, device=out.index if out else None)
         name = os.path.basename(path)
         self.music_status.configure(text=f"オフボーカルを再生中: {name}")
         self.play_button.configure(text="⏸ 一時停止")
         self.video_label.configure(image="", text=f"♪ {name}（ボーカル除去済み）")
+
+    # ---------- 歌詞 ----------
+    def request_lyrics(self, title: str, duration: float | None) -> None:
+        """曲名から時刻つき歌詞を探して、映像の下に出す。
+
+        オフボーカル動画のタイトルは飾りが多いので、そこから曲名を推定して
+        突き合わせる。外したときは「曲を指定」から手で直せる。
+        """
+        self.current_lyrics = None
+        self._hide_lyrics()
+        if not self.cfg.get("show_lyrics", True) or not title:
+            return
+
+        def work():
+            import lyrics
+            return lyrics.best_match(title, duration)
+
+        def done(result):
+            self.current_lyrics = result
+            if result is None or not result.synced:
+                self.lyric_status.configure(
+                    text="歌詞が見つかりませんでした（「曲を指定」で探せます）")
+                return
+            self.lyric_box.grid()
+            self.lyric_status.configure(
+                text=f"歌詞: {result.track} / {result.artist}（{len(result.lines)} 行）")
+
+        self.lyric_status.configure(text="歌詞を探しています…")
+        self.run_async(work, done)
+
+    def _on_lyrics_toggle(self) -> None:
+        self.cfg["show_lyrics"] = bool(self.show_lyrics_var.get())
+        if not self.cfg["show_lyrics"]:
+            self._hide_lyrics()
+            self.lyric_status.configure(text="")
+        elif self.current_track is not None:
+            self.request_lyrics(self.current_track.title, self.player.duration)
+
+    def _update_lyric_display(self) -> None:
+        """再生位置に合わせて、いまの行と次の行を出す。"""
+        lyric = self.current_lyrics
+        if lyric is None or not lyric.synced or not self.show_lyrics_var.get():
+            return
+        current, following = lyric.at(self.player.position)
+        if self.lyric_now["text"] != current:
+            self.lyric_now.configure(text=current)
+            self.lyric_next.configure(text=following)
+
+    def _hide_lyrics(self) -> None:
+        self.lyric_box.grid_remove()
+        self.lyric_now.configure(text="")
+        self.lyric_next.configure(text="")
+
+    def choose_lyrics(self) -> None:
+        """歌詞が合わないときに、曲名を自分で指定して選び直す。"""
+        import lyrics
+
+        guess = ""
+        if self.current_track is not None:
+            guess = " ".join(lyrics.clean_title(self.current_track.title)).strip()
+        elif self.current_local_path:
+            guess = os.path.splitext(os.path.basename(self.current_local_path))[0]
+
+        window = tk.Toplevel(self)
+        window.title("歌詞を探す")
+        window.transient(self)
+        frame = ttk.Frame(window, padding=12)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="曲名（アーティスト名も入れると当たりやすい）").pack(anchor="w")
+        query = tk.StringVar(value=guess)
+        entry = ttk.Entry(frame, textvariable=query, width=46)
+        entry.pack(fill="x", pady=6)
+
+        tree = ttk.Treeview(frame, columns=("track", "artist", "length", "synced"),
+                            show="headings", height=8)
+        for column, text, width in (("track", "曲名", 200), ("artist", "アーティスト", 150),
+                                    ("length", "長さ", 60), ("synced", "時刻", 60)):
+            tree.heading(column, text=text)
+            tree.column(column, width=width)
+        tree.pack(fill="both", expand=True)
+        candidates: list = []
+
+        def look() -> None:
+            text = query.get().strip()
+            if not text:
+                return
+            duration = self.player.duration
+
+            def work():
+                parts = text.split(" ", 1)
+                track = parts[0] if len(parts) == 1 else text
+                return lyrics.search(track, "", duration, limit=12)
+
+            def done(result):
+                candidates.clear()
+                candidates.extend(result)
+                tree.delete(*tree.get_children())
+                for item in result:
+                    tree.insert("", "end", values=(
+                        item.track, item.artist,
+                        time_text(item.duration) if item.duration else "-",
+                        "あり" if item.synced else "なし"))
+
+            self.run_async(work, done)
+
+        def apply(_event=None) -> None:
+            selection = tree.selection()
+            if not selection:
+                return
+            chosen = candidates[tree.index(selection[0])]
+            self.current_lyrics = chosen
+            if chosen.synced:
+                self.lyric_box.grid()
+            self.lyric_status.configure(
+                text=f"歌詞: {chosen.track} / {chosen.artist}"
+                     + ("" if chosen.synced else "（時刻なし・表示できません）"))
+            window.destroy()
+
+        tree.bind("<Double-1>", apply)
+        entry.bind("<Return>", lambda _e: look())
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill="x", pady=(8, 0))
+        ttk.Button(buttons, text="探す", command=look).pack(side="left")
+        ttk.Button(buttons, text="これにする", command=apply).pack(side="right")
+        ttk.Button(buttons, text="閉じる", command=window.destroy).pack(side="right", padx=6)
+        self._lyrics_dialog = {"window": window, "tree": tree, "look": look,
+                               "apply": apply, "query": query, "candidates": candidates}
+        entry.focus_set()
+        if guess:
+            look()
+
+    def play_url(self, url: str) -> None:
+        """URL を直接受け取って再生する（YouTube のリンクを貼り付けたとき）。"""
+        out = self.selected_device("output")
+        quality = int(self.cfg.get("video_quality", 720))
+        self.current_local_path = None
+        self.player.stop()
+        self.music_status.configure(text="読み込み中…")
+
+        def work():
+            source = music_search.resolve(url, max_height=quality)
+            # あとで「ボーカルを消す」やキー変更に使えるよう、曲の情報も持っておく
+            return source
+
+        def done(source):
+            self.current_track = music_search.Track(
+                id=url, title=source.title or url, duration=source.duration)
+            self._start_playback(source, out)
+
+        self.run_async(work, done, busy_text="URL から読み込んでいます…")
+
+    def show_ranking(self) -> None:
+        """カラオケの人気曲一覧を出して、選んだ曲を検索欄へ入れる。"""
+        import ranking
+
+        window = tk.Toplevel(self)
+        window.title("カラオケ ランキング")
+        window.geometry("620x520")
+        window.transient(self)
+
+        head = ttk.Frame(window, padding=(10, 10, 10, 4))
+        head.pack(fill="x")
+        ttk.Label(head, text="種類").pack(side="left")
+        source_var = tk.StringVar(value=list(ranking.SOURCES)[0])
+        picker = ttk.Combobox(head, textvariable=source_var,
+                              values=list(ranking.SOURCES), state="readonly", width=14)
+        picker.pack(side="left", padx=6)
+        status = ttk.Label(head, text="読み込み中…", style="Hint.TLabel")
+        status.pack(side="left", padx=8)
+
+        columns = ("rank", "title", "artist")
+        tree = ttk.Treeview(window, columns=columns, show="headings")
+        for column, text, width, anchor in (("rank", "順位", 50, "center"),
+                                            ("title", "曲名", 300, "w"),
+                                            ("artist", "アーティスト", 200, "w")):
+            tree.heading(column, text=text)
+            tree.column(column, width=width, anchor=anchor)
+        tree.pack(fill="both", expand=True, padx=10, pady=6)
+
+        songs: list = []
+
+        def load(refresh: bool = False) -> None:
+            # 画面の値はメインスレッドで読んでおく。
+            # ワーカースレッドから Tk を触ると落ちる。
+            name = source_var.get()
+            status.configure(text="読み込み中…")
+            tree.delete(*tree.get_children())
+
+            def work():
+                return ranking.fetch(name, refresh=refresh)
+
+            def done(result):
+                songs.clear()
+                songs.extend(result)
+                tree.delete(*tree.get_children())
+                for song in result:
+                    tree.insert("", "end", values=(song.rank, song.title, song.artist))
+                status.configure(text=f"{len(result)} 曲")
+
+            self.run_async(work, done)
+
+        def choose(_event=None) -> None:
+            selection = tree.selection()
+            if not selection:
+                return
+            song = songs[tree.index(selection[0])]
+            self.query_var.set(song.query)
+            window.destroy()
+            self.search()
+
+        tree.bind("<Double-1>", choose)
+        tree.bind("<Return>", choose)
+        picker.bind("<<ComboboxSelected>>", lambda _e: load())
+        # 外から操作できるようにしておく（キー操作の追加や動作確認に使う）
+        self._ranking = {"window": window, "tree": tree, "songs": songs,
+                         "choose": choose, "load": load}
+        window.bind("<Escape>", lambda _e: window.destroy())
+
+        buttons = ttk.Frame(window, padding=(10, 0, 10, 10))
+        buttons.pack(fill="x")
+        ttk.Label(buttons, text="曲を選ぶと、その曲名で検索します",
+                  style="Hint.TLabel").pack(side="left")
+        ttk.Button(buttons, text="閉じる", command=window.destroy).pack(side="right")
+        ttk.Button(buttons, text="この曲を検索", command=choose).pack(side="right", padx=6)
+        ttk.Button(buttons, text="取り直す", command=lambda: load(True)).pack(side="right")
+        load()
 
     def open_local_file(self) -> None:
         """買った音源や自分で作ったオフボーカルを直接再生する。"""
@@ -1561,6 +2009,9 @@ class KaraokeApp(tk.Tk):
         self.cfg["last_folder"] = os.path.dirname(path)
         self.current_track = None
         self.current_local_path = path
+        if int(self.cfg.get("pitch_semitones", 0)):
+            self.apply_key_to_current()
+            return
         out = self.selected_device("output")
         self.player.stop()
         self._photo = None
@@ -1571,6 +2022,8 @@ class KaraokeApp(tk.Tk):
         self.music_status.configure(text=f"再生中: {name}")
         self.play_button.configure(text="⏸ 一時停止")
         self.video_label.configure(image="", text=f"♪ {name}")
+        # ファイル名から曲を推し量る（外したら「曲を指定」で直せる）
+        self.request_lyrics(os.path.splitext(name)[0], self.player.duration)
 
     def show_sources(self) -> None:
         messagebox.showinfo(
@@ -1622,12 +2075,17 @@ class KaraokeApp(tk.Tk):
         )
 
     def _start_playback(self, src, out) -> None:
+        if int(self.cfg.get("pitch_semitones", 0)):
+            # キーを変える場合は、手元に取り込んでから変換して鳴らす
+            self.apply_key_to_current()
+            return
         self.player.set_display_size(max(2, self.video_label.winfo_width()),
                                     max(2, self.video_label.winfo_height()))
         self.player.open(src.video_url, src.audio_url, src.headers,
                          device=out.index if out else None, duration=src.duration)
         self.music_status.configure(text=f"再生中: {src.title}")
         self.play_button.configure(text="⏸ 一時停止")
+        self.request_lyrics(src.title, src.duration)
 
     def toggle_play(self) -> None:
         """再生と一時停止を切り替える。何も読み込んでいなければ選択中の曲を再生する。"""
@@ -1657,6 +2115,79 @@ class KaraokeApp(tk.Tk):
         if state == "opening":
             self.play_button.configure(text="… 準備中")
 
+    VIDEO_EXTENSIONS = (".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v")
+
+    def change_key(self, delta: int) -> None:
+        """伴奏のキーを半音単位で上げ下げする。
+
+        曲まるごと変換してから鳴らす。ブロックごとに変換すると継ぎ目で
+        ぷつぷつ鳴ったり音が重なったりするため、その方式は採らない。
+        """
+        value = int(np.clip(self.cfg.get("pitch_semitones", 0) + delta, -6, 6))
+        if value == self.cfg.get("pitch_semitones", 0):
+            return
+        self.cfg["pitch_semitones"] = value
+        self.key_label.configure(text=f"{value:+d}" if value else "±0")
+        if self.player.state not in ("playing", "paused"):
+            self.music_status.configure(
+                text=f"キー {value:+d} で次から再生します" if value else "キーを元に戻しました")
+            return
+        self.apply_key_to_current()
+
+    def apply_key_to_current(self) -> None:
+        """いま鳴っている曲に、選んだキーを適用し直す。"""
+        import pitch_render
+
+        key = int(self.cfg.get("pitch_semitones", 0))
+        position = self.player.position
+        track = self.current_track
+        source = self.current_local_path
+        if source is None and track is None:
+            return
+
+        def report(stage: str, ratio: float) -> None:
+            self.post(self.music_status.configure,
+                      {"text": f"キー {key:+d} を準備中: {stage}… {ratio*100:.0f}%"})
+
+        def work():
+            local = source
+            if local is None:  # 配信中の曲は、先に手元へ取り込む
+                report("音源を取得中", 0.05)
+                folder = os.path.join(pitch_render.CACHE_DIR, "download")
+                os.makedirs(folder, exist_ok=True)
+                local = music_search.download(track.id, folder, max_height=480)
+            rendered = pitch_render.render(local, key, progress=report) if key else local
+            return local, rendered
+
+        self.player.stop()
+        self.run_async(work, lambda r: self._play_with_key(*r, position),
+                       busy_text=f"キー {key:+d} を準備しています…")
+
+    def _play_with_key(self, source: str, rendered: str, position: float) -> None:
+        """映像は元のまま、音声だけ差し替えて再生する。"""
+        out = self.selected_device("output")
+        device = out.index if out else None
+        self.current_local_path = source
+        self._photo = None
+        has_video = source.lower().endswith(self.VIDEO_EXTENSIONS)
+
+        if rendered == source:
+            self.player.open(source, None, {}, device=device)
+        elif has_video:
+            self.player.open(source, rendered, {}, device=device)
+        else:
+            self.player.open(rendered, None, {}, device=device)
+
+        key = int(self.cfg.get("pitch_semitones", 0))
+        name = os.path.basename(source)
+        self.music_status.configure(
+            text=f"再生中: {name}" + (f"（キー {key:+d}）" if key else ""))
+        self.play_button.configure(text="⏸ 一時停止")
+        title = self.current_track.title if self.current_track else name
+        self.request_lyrics(title, self.player.duration)
+        if position > 1.0:  # 元の位置から続ける
+            self.after(1200, lambda: self.player.seek(position))
+
     def stop_music(self, message: str = "停止しました") -> None:
         self.player.stop()
         self.video_label.configure(image="", text="ここに映像が出ます")
@@ -1667,7 +2198,12 @@ class KaraokeApp(tk.Tk):
         self._refresh_transport()
 
     def _player_error(self, error) -> None:
-        self.music_status.configure(text=f"再生できませんでした: {error}")
+        LOG.error("再生に失敗しました: %r", error)
+        message = friendly_error(error)
+        self.music_status.configure(text=f"再生できませんでした: {message}")
+        self._refresh_transport()
+        # 小さな灰色の文字だけだと「押しても何も起きない」に見えるので、はっきり出す
+        messagebox.showerror(APP_TITLE, f"再生できませんでした。\n\n{message}")
 
     def _on_video_resize(self, event) -> None:
         self.player.set_display_size(event.width, event.height)
@@ -1704,15 +2240,19 @@ class KaraokeApp(tk.Tk):
         except queue.Empty:
             pass
 
-        # レベルメーター
+        # レベルメーターと、遅延・途切れの状況
         if self.router.running:
             in_peak = self.chain.in_peak if self.chain.enabled else self.router.in_peak
             self.in_meter["value"] = meter_value(in_peak)
             self.out_meter["value"] = meter_value(self.router.out_peak)
             self.in_db_label.configure(text=f"{db_of(in_peak):.0f} dB")
             self.out_db_label.configure(text=f"{db_of(self.router.out_peak):.0f} dB")
+            self._tick_count = getattr(self, "_tick_count", 0)
+            if self._tick_count % 15 == 0:
+                self._update_quality_label()
         elif self.in_meter["value"]:
             self.in_meter["value"] = self.out_meter["value"] = 0
+            self.quality_label.configure(text="")
 
         # 映像
         image = self.player.take_frame()
@@ -1738,6 +2278,7 @@ class KaraokeApp(tk.Tk):
             self.time_label.configure(text=f"{time_text(position)} / {time_text(duration)}")
             if duration and not self._seeking:
                 self.position_var.set(min(1000.0, position / duration * 1000.0))
+            self._update_lyric_display()
             if self.player.finished:
                 self.stop_music("再生が終わりました")
 
@@ -1747,7 +2288,7 @@ class KaraokeApp(tk.Tk):
     def on_close(self) -> None:
         self.cfg["music_volume"] = self.music_volume_var.get()
         self.cfg["hostapi"] = self.api_var.get()
-        self.cfg["latency"] = self.latency_var.get()
+        self.cfg["latency"] = LATENCY_MODES.get(self.latency_var.get(), "low")
         self.cfg["buffer_ms"] = float(self.buffer_var.get())
         self.cfg["prefer_off_vocal"] = self.offvocal_var.get()
         self.cfg["vst3"] = self.chain.vst_state()

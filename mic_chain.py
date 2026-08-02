@@ -351,9 +351,12 @@ class MicChain:
         self.reverb = Reverb(room_size=0.25, damping=0.5, wet_level=0.0, dry_level=1.0)
         self.limiter = Limiter(threshold_db=-1.0, release_ms=100.0)
 
-        self.denoiser = SpectralDenoiser(rate)
+        # ノイズ除去はチャンネルごとに状態を持つ必要がある。
+        # ステレオで 1 つを共用すると左右が混ざって位相が壊れる。
+        self.channels = 1
+        self.denoisers = [SpectralDenoiser(rate)]
         self.denoise_engine = "spectral"  # spectral / rnnoise
-        self.rnnoise: RNNoiseDenoiser | None = None
+        self.rnnoisers: list[RNNoiseDenoiser] = []
         self._vst: list[VstSlot] = []
         self._board = Pedalboard([])
         self._lock = threading.Lock()
@@ -464,36 +467,87 @@ class MicChain:
 
     # ---------- 本体 ----------
     def process(self, x: np.ndarray) -> np.ndarray:
-        """モノラルブロックを処理して返す。"""
-        self.in_peak = float(np.abs(x).max()) if len(x) else 0.0
+        """ブロックを処理して返す。
+
+        x は (サンプル,) か (サンプル, チャンネル)。形は保ったまま返す。
+        ノイズ除去はチャンネルごとに、その後の効果とプラグインは
+        まとめて通す（ステレオのプラグインが意味を持つように）。
+        """
+        self.in_peak = float(np.abs(x).max()) if x.size else 0.0
         if not self.enabled:
             self.out_peak = self.in_peak
             return x
 
-        y = x.astype(np.float32)
+        mono_in = x.ndim == 1
+        frames = x.reshape(-1, 1) if mono_in else x
+        channels = frames.shape[1]
+        if channels != self.channels:
+            self.set_channels(channels)
+
+        y = frames.astype(np.float32, copy=True)
         if self.denoise:
-            if self.denoise_engine == "rnnoise" and self.rnnoise is not None:
-                y = self.rnnoise.process(y)
-            else:
-                y = self.denoiser.process(y)
+            use_rnnoise = self.denoise_engine == "rnnoise" and len(self.rnnoisers) == channels
+            for index in range(channels):
+                engine = self.rnnoisers[index] if use_rnnoise else self.denoisers[index]
+                y[:, index] = engine.process(y[:, index])
+
         with self._lock:
             board = self._board
         # reset=False で内部状態を保持し、ブロックをまたいで連続処理する
-        y = board(y, self.rate, reset=False)
-        y = np.asarray(y, dtype=np.float32).reshape(-1)[: len(x)]
-        if len(y) < len(x):  # プラグインの遅延で短くなった場合を埋める
-            y = np.concatenate([y, np.zeros(len(x) - len(y), dtype=np.float32)])
+        processed = np.asarray(board(y, self.rate, reset=False), dtype=np.float32)
+        if processed.ndim == 1:
+            processed = processed.reshape(-1, 1)
+        if len(processed) < len(frames):  # プラグインの遅延で短くなった場合を埋める
+            pad = np.zeros((len(frames) - len(processed), processed.shape[1]), np.float32)
+            processed = np.concatenate([processed, pad])
+        processed = processed[: len(frames)]
+        if processed.shape[1] != channels:  # プラグインがチャンネル数を変えた場合
+            processed = (processed[:, :1].repeat(channels, axis=1) if processed.shape[1] == 1
+                         else processed[:, :channels])
 
-        self.out_peak = float(np.abs(y).max()) if len(y) else 0.0
-        return y
+        self.out_peak = float(np.abs(processed).max()) if processed.size else 0.0
+        return processed.reshape(-1) if mono_in else processed
+
+    @property
+    def denoiser(self) -> SpectralDenoiser:
+        """1 本目のノイズ除去器。学習状態を見るときなどに使う。"""
+        return self.denoisers[0]
+
+    @property
+    def denoise_strength(self) -> float:
+        return self.denoisers[0].strength
+
+    @denoise_strength.setter
+    def denoise_strength(self, value: float) -> None:
+        for denoiser in self.denoisers:
+            denoiser.strength = float(value)
+
+    def set_channels(self, channels: int) -> None:
+        """扱うチャンネル数を変える。チャンネルごとの状態を作り直す。"""
+        channels = max(1, int(channels))
+        if channels == self.channels and len(self.denoisers) == channels:
+            return
+        strength = self.denoisers[0].strength
+        fixed = self.denoisers[0]._fixed_noise
+        self.channels = channels
+        self.denoisers = []
+        for _ in range(channels):
+            denoiser = SpectralDenoiser(self.rate, strength=strength)
+            denoiser._fixed_noise = fixed  # 学習結果は引き継ぐ
+            self.denoisers.append(denoiser)
+        if self.rnnoisers:
+            for r in self.rnnoisers:
+                r.close()
+            self.rnnoisers = [RNNoiseDenoiser(self.rate) for _ in range(channels)]
 
     def learn_noise(self) -> None:
         """これから流れる音をノイズとして覚え始める（静かにしている間に呼ぶ）。"""
-        self.denoiser.start_learning()
+        for denoiser in self.denoisers:
+            denoiser.start_learning()
 
     def finish_learning(self) -> bool:
         """学習を確定する。十分なデータが集まっていれば True。"""
-        return self.denoiser.stop_learning()
+        return all(denoiser.stop_learning() for denoiser in self.denoisers)
 
     def set_denoise_engine(self, name: str) -> None:
         """ノイズ除去の方式を切り替える。使えないときは例外を投げる。"""
@@ -501,11 +555,14 @@ class MicChain:
             if self.rate != RNNoiseDenoiser.RATE:
                 raise RuntimeError(
                     f"RNNoise は 48kHz のマイクでのみ使えます（今は {self.rate}Hz）")
-            if self.rnnoise is None:
-                self.rnnoise = RNNoiseDenoiser(self.rate)
-        elif self.rnnoise is not None:
-            self.rnnoise.close()
-            self.rnnoise = None
+            if len(self.rnnoisers) != self.channels:
+                for r in self.rnnoisers:
+                    r.close()
+                self.rnnoisers = [RNNoiseDenoiser(self.rate) for _ in range(self.channels)]
+        else:
+            for r in self.rnnoisers:
+                r.close()
+            self.rnnoisers = []
         self.denoise_engine = name
 
     def set_rate(self, rate: int) -> None:
@@ -513,13 +570,15 @@ class MicChain:
         if rate == self.rate:
             return
         self.rate = rate
-        strength = self.denoiser.strength
-        self.denoiser = SpectralDenoiser(rate, strength=strength)
-        if self.rnnoise is not None:  # 48kHz 以外では使えないので作り直す
-            self.rnnoise.close()
-            self.rnnoise = None
+        strength = self.denoisers[0].strength
+        self.denoisers = [SpectralDenoiser(rate, strength=strength)
+                          for _ in range(self.channels)]
+        if self.rnnoisers:  # 48kHz 以外では使えないので作り直す
+            for r in self.rnnoisers:
+                r.close()
+            self.rnnoisers = []
             if rate == RNNoiseDenoiser.RATE:
-                self.rnnoise = RNNoiseDenoiser(rate)
+                self.rnnoisers = [RNNoiseDenoiser(rate) for _ in range(self.channels)]
             else:
                 self.denoise_engine = "spectral"
         self.reset()
@@ -528,7 +587,10 @@ class MicChain:
         """内部状態を捨てる。学習済みノイズプロファイルは維持する。"""
         with self._lock:
             self._board.reset()
-        self.denoiser.reset_buffers()
+        for denoiser in self.denoisers:
+            denoiser.reset_buffers()
+        for r in self.rnnoisers:
+            r.reset_buffers()
 
 
 def karaoke_preset(chain: MicChain) -> None:
