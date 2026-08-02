@@ -27,8 +27,14 @@ for package in ("_sounddevice_data", "av", "pedalboard", "yt_dlp", "numpy", "sci
     binaries += package_binaries
     hiddenimports += package_hidden
 
-# 子プロセス（プラグイン画面）は app.py --vst-editor から呼ばれる
-hiddenimports += ["vst_editor_host", "sounddevice"]
+# 子プロセス（プラグイン画面）は app.py --vst-editor から呼ばれる。
+# 残りは関数の中で読み込んでいるもの。静的解析でも拾えるはずだが、
+# 取りこぼすと実行時に落ちるだけなので明示しておく。
+hiddenimports += [
+    "vst_editor_host", "sounddevice", "applog", "config", "comutil", "devices",
+    "lyrics", "mic_chain", "model_installer", "music_search", "pitch_render",
+    "platform_support", "player", "ranking", "router", "separator",
+]
 
 # アイコン
 datas += [(os.path.join(ROOT, "assets"), "assets")]
