@@ -14,6 +14,7 @@ pedalboard（JUCE ベース、C++ 実装なのでリアルタイムでも軽い�
 from __future__ import annotations
 
 import os
+import re
 import threading
 from dataclasses import dataclass, field
 
@@ -59,6 +60,30 @@ def available_vst3() -> list[tuple[str, str]]:
     return sorted(found.items())
 
 
+def plugin_names(path: str) -> list[str]:
+    """1 つのファイルに複数のプラグインが入っている場合、その名前を返す。
+
+    Serum2 や Reaktor のように本体とエフェクト版が同居しているものがある。
+    1 つしか入っていなければ空のリストを返す。
+    """
+    try:
+        from pedalboard import VST3Plugin
+        names = VST3Plugin.get_plugin_names_for_file(path)
+    except Exception:
+        return []  # 走査できない形式もある。その場合は読み込み時のエラーから拾う
+    return list(names) if names and len(names) > 1 else []
+
+
+def names_from_error(message: str) -> list[str]:
+    """読み込み失敗のメッセージから候補名を拾う。
+
+    走査に失敗する環境でも、pedalboard は候補名を並べたエラーを返してくれる。
+    """
+    if "plugin_name" not in message:
+        return []
+    return re.findall(r'"([^"]+)"', message)
+
+
 @dataclass
 class VstSlot:
     """チェーンに挿した VST3 ひとつぶん。"""
@@ -67,6 +92,7 @@ class VstSlot:
     path: str
     plugin: object
     bypass: bool = False
+    plugin_name: str | None = None  # 1 ファイルに複数入っている場合の指定
 
     def parameter_state(self) -> dict:
         """パラメータを 0〜1 の正規化値で書き出す。
@@ -250,13 +276,22 @@ class MicChain:
             n.cutoff_frequency_hz = freq * (i + 1)
 
     # ---------- VST3 ----------
-    def add_vst3(self, path: str, name: str | None = None) -> VstSlot:
-        """VST3 を後段に追加する。読み込みに数秒かかるので別スレッドから呼ぶこと。"""
-        plugin = load_plugin(path)
+    def add_vst3(self, path: str, name: str | None = None,
+                 plugin_name: str | None = None) -> VstSlot:
+        """VST3 を後段に追加する。
+
+        1 つのファイルに複数のプラグインが入っている場合は plugin_name で選ぶ。
+        """
+        plugin = load_plugin(path, plugin_name=plugin_name) if plugin_name \
+            else load_plugin(path)
+        label = name or os.path.splitext(os.path.basename(path))[0]
+        if plugin_name and plugin_name not in label:
+            label = f"{label}（{plugin_name}）"
         slot = VstSlot(
-            name=name or os.path.splitext(os.path.basename(path))[0],
+            name=label,
             path=path,
             plugin=plugin,
+            plugin_name=plugin_name,
         )
         self._vst.append(slot)
         self._rebuild()
@@ -290,7 +325,7 @@ class MicChain:
         """保存用。次回起動時に同じ構成を復元できるようにする。"""
         return [
             {"name": s.name, "path": s.path, "bypass": s.bypass,
-             "params": s.parameter_state()}
+             "plugin_name": s.plugin_name, "params": s.parameter_state()}
             for s in self._vst
         ]
 
@@ -310,7 +345,7 @@ class MicChain:
                 failed.append(entry.get("name", path))
                 continue
             try:
-                slot = self.add_vst3(path, entry.get("name"))
+                slot = self.add_vst3(path, entry.get("name"), entry.get("plugin_name"))
                 slot.apply_parameter_state(entry.get("params", {}))
                 if entry.get("bypass"):
                     self.set_bypass(slot, True)

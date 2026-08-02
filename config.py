@@ -29,6 +29,7 @@ DEFAULTS: dict[str, Any] = {
         "hum_hz": 50.0,
         "hum_notch_db": -12.0,
         "denoise": True,
+        "denoise_mode": "標準",
         "denoise_strength": 1.8,
         "gate_db": -42.0,
         "comp_threshold_db": -24.0,
@@ -47,10 +48,18 @@ DEFAULTS: dict[str, Any] = {
 }
 
 
+def _saved_path() -> str:
+    """設定ファイルの場所。名前を変える前のものが残っていればそちらを読む。"""
+    if os.path.exists(CONFIG_PATH):
+        return CONFIG_PATH
+    old = os.path.join(os.path.dirname(APP_DIR), "KaraokeStudio", "settings.json")
+    return old if os.path.exists(old) else CONFIG_PATH
+
+
 def load() -> dict[str, Any]:
     data = json.loads(json.dumps(DEFAULTS))  # 深いコピー
     try:
-        with open(CONFIG_PATH, encoding="utf-8") as f:
+        with open(_saved_path(), encoding="utf-8") as f:
             saved = json.load(f)
     except (OSError, ValueError):
         return data

@@ -14,7 +14,7 @@ WINDOWS = sys.platform == "win32"
 MACOS = sys.platform == "darwin"
 LINUX = sys.platform.startswith("linux")
 
-APP_NAME = "KaraokeStudio"
+APP_NAME = "VoxDesk"
 
 
 # ---------- 置き場所 ----------
@@ -160,5 +160,5 @@ def sound_settings_hint() -> str:
 def launcher_hint() -> str:
     """起動方法の案内（エラー時などに出す）。"""
     if WINDOWS:
-        return "カラオケスタジオを起動.bat をダブルクリックしてください"
+        return "VoxDesk を起動.bat をダブルクリックしてください"
     return "./start.sh を実行してください"

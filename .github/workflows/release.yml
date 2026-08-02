@@ -67,7 +67,7 @@ jobs:
           pip install pyinstaller==6.11.1
 
       - name: 実行ファイルを作る
-        run: pyinstaller --noconfirm --clean packaging/KaraokeStudio.spec
+        run: pyinstaller --noconfirm --clean packaging/VoxDesk.spec
 
       # ---------- Windows: インストーラ ----------
       - name: Inno Setup を入れる
@@ -85,10 +85,10 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           mkdir -p dmg dist/installer
-          cp -R "dist/KaraokeStudio.app" dmg/
+          cp -R "dist/VoxDesk.app" dmg/
           ln -s /Applications dmg/Applications
-          hdiutil create -volname "カラオケスタジオ" -srcfolder dmg -ov -format UDZO \
-            "dist/installer/KaraokeStudio-${{ steps.version.outputs.value }}-${{ matrix.artifact }}.dmg"
+          hdiutil create -volname "VoxDesk" -srcfolder dmg -ov -format UDZO \
+            "dist/installer/VoxDesk-${{ steps.version.outputs.value }}-${{ matrix.artifact }}.dmg"
 
       # ---------- Linux: tar.gz ----------
       - name: tar.gz を作る
@@ -96,10 +96,10 @@ jobs:
         run: |
           mkdir -p dist/installer
           # 凍結ビルドなので start.sh（仮想環境を作る用）は入れない
-          cp README.md dist/KaraokeStudio/
-          chmod +x dist/KaraokeStudio/KaraokeStudio
-          tar czf "dist/installer/KaraokeStudio-${{ steps.version.outputs.value }}-linux-x86_64.tar.gz" \
-            -C dist KaraokeStudio
+          cp README.md dist/VoxDesk/
+          chmod +x dist/VoxDesk/VoxDesk
+          tar czf "dist/installer/VoxDesk-${{ steps.version.outputs.value }}-linux-x86_64.tar.gz" \
+            -C dist VoxDesk
 
       - name: 配布物を保存する
         uses: actions/upload-artifact@v7
@@ -124,7 +124,7 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
-          name: カラオケスタジオ ${{ github.ref_name }}
+          name: VoxDesk ${{ github.ref_name }}
           draft: false
           generate_release_notes: true
           files: artifacts/**/*
@@ -136,7 +136,7 @@ jobs:
             | Windows | `*-windows-x64-setup.exe` | 実行してインストール |
             | macOS (Apple Silicon) | `*-macos-arm64.dmg` | 開いて Applications へドラッグ |
             | macOS (Intel) | `*-macos-x86_64.dmg` | 同上 |
-            | Linux | `*-linux-x86_64.tar.gz` | 展開して `./KaraokeStudio` |
+            | Linux | `*-linux-x86_64.tar.gz` | 展開して `./VoxDesk` |
 
             ### macOS で「開発元を確認できない」と出たら
 
@@ -144,7 +144,7 @@ jobs:
             アプリを右クリック →「開く」を選ぶか、次を実行してください。
 
             ```
-            xattr -dr com.apple.quarantine /Applications/KaraokeStudio.app
+            xattr -dr com.apple.quarantine /Applications/VoxDesk.app
             ```
 
             ### Linux で音が出ないとき

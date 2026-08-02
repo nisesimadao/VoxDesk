@@ -5,8 +5,8 @@
   #define AppVersion "0.0.0"
 #endif
 
-#define AppName "カラオケスタジオ"
-#define AppExeName "KaraokeStudio.exe"
+#define AppName "VoxDesk"
+#define AppExeName "VoxDesk.exe"
 #define Publisher "nisesimadao"
 
 [Setup]
@@ -14,17 +14,19 @@ AppId={{8A5F2E31-4C7D-4B9A-9E42-1D6C3F8B7A20}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppPublisher={#Publisher}
-DefaultDirName={autopf}\KaraokeStudio
+DefaultDirName={autopf}\VoxDesk
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
 ; 管理者権限を求めず、ユーザー領域に入れる
 PrivilegesRequiredOverridesAllowed=dialog
 PrivilegesRequired=lowest
 OutputDir=..\dist\installer
-OutputBaseFilename=KaraokeStudio-{#AppVersion}-windows-x64-setup
+OutputBaseFilename=VoxDesk-{#AppVersion}-windows-x64-setup
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
+SetupIconFile=..\assets\icon.ico
+UninstallDisplayIcon={app}\{#AppExeName}
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 UninstallDisplayName={#AppName}
@@ -37,7 +39,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "デスクトップにショートカットを作る"; GroupDescription: "追加のタスク:"
 
 [Files]
-Source: "..\dist\KaraokeStudio\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\dist\VoxDesk\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]

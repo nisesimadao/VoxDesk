@@ -187,6 +187,17 @@ def _check_input(device: Device, seconds: float) -> Health:
     return Health(True, f"{device.rate}Hz で使えます", receives_audio=True, peak_db=peak_db)
 
 
+# マイク側で AI ノイズ除去をしてくれる仮想マイク。入っていれば選ぶだけで使える。
+AI_MICROPHONES = ("RTX Voice", "NVIDIA Broadcast", "Krisp", "Voice Isolation",
+                  "SteelSeries Sonar", "Elgato Wave")
+
+
+def ai_microphones(hostapi: str | None = None) -> list[Device]:
+    """AI ノイズ除去つきの仮想マイクを探す。"""
+    return [d for d in list_devices("input", hostapi)
+            if any(name.lower() in d.name.lower() for name in AI_MICROPHONES)]
+
+
 def describe_error(e: Exception) -> str:
     """PortAudio のエラーを利用者向けの文言にする。"""
     if isinstance(e, UnicodeDecodeError):

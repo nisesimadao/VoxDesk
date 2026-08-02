@@ -30,6 +30,16 @@ for package in ("_sounddevice_data", "av", "pedalboard", "yt_dlp", "numpy", "sci
 # 子プロセス（プラグイン画面）は app.py --vst-editor から呼ばれる
 hiddenimports += ["vst_editor_host", "sounddevice"]
 
+# アイコン
+datas += [(os.path.join(ROOT, "assets"), "assets")]
+if sys.platform == "win32":
+    icon = os.path.join(ROOT, "assets", "icon.ico")
+else:
+    # PyInstaller が Pillow を使って必要な形式に変換してくれる
+    icon = os.path.join(ROOT, "assets", "icon_512.png")
+if not os.path.exists(icon):
+    icon = None
+
 analysis = Analysis(
     [os.path.join(ROOT, "app.py")],
     pathex=[ROOT],
@@ -48,7 +58,7 @@ executable = EXE(
     analysis.scripts,
     [],
     exclude_binaries=True,
-    name="KaraokeStudio",
+    name="VoxDesk",
     debug=False,
     strip=False,
     upx=False,
@@ -56,6 +66,7 @@ executable = EXE(
     # 起動時の例外がその場に表示され、原因を追える
     console=bool(os.environ.get("KS_CONSOLE")),
     disable_windowed_traceback=False,
+    icon=icon,
 )
 
 collection = COLLECT(
@@ -64,17 +75,18 @@ collection = COLLECT(
     analysis.datas,
     strip=False,
     upx=False,
-    name="KaraokeStudio",
+    name="VoxDesk",
 )
 
 if sys.platform == "darwin":
     app = BUNDLE(
         collection,
-        name="KaraokeStudio.app",
-        bundle_identifier="net.raiid.karaokestudio",
+        name="VoxDesk.app",
+        icon=icon,
+        bundle_identifier="net.raiid.voxdesk",
         info_plist={
-            "CFBundleName": "KaraokeStudio",
-            "CFBundleDisplayName": "カラオケスタジオ",
+            "CFBundleName": "VoxDesk",
+            "CFBundleDisplayName": "VoxDesk",
             "NSHighResolutionCapable": True,
             # macOS ではマイク利用の理由を書かないと録音が拒否される
             "NSMicrophoneUsageDescription":
