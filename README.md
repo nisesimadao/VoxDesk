@@ -65,7 +65,11 @@ Apple Music や Spotify は音声が保護されているため取り込めま�
 | Apple Silicon（macOS） | メモリ 16 GB 以上。32 GB 以上で高品質モデル |
 | それ以外 | 使えません（CPU だけで動かすと 1 曲に数十分かかるため、あえて無効にしています） |
 
-導入（合計 3 GB ほどダウンロードします）:
+**アプリから有効にできます。** 対応する機器があれば、初回起動時に案内が出ます。
+あとからでも「設定・診断」タブの「AI ボーカル除去」で有効にでき、同じ場所から削除もできます。
+取得したものは設定フォルダの `runtime` に入り、アプリ本体には手を加えません。
+
+手動で入れる場合は次のとおりです（合計 3 GB ほど）。
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install torch --index-url https://download.pytorch.org/whl/cu126

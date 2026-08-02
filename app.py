@@ -399,8 +399,20 @@ class KaraokeApp(tk.Tk):
             self.diag_tree.column(col, width=width, anchor="w")
         self.diag_tree.grid(row=2, column=0, sticky="nsew")
 
+        vocal = ttk.LabelFrame(tab, text=" AI ボーカル除去 ", padding=10)
+        vocal.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        vocal.columnconfigure(0, weight=1)
+        self.vocal_setup_label = ttk.Label(vocal, text="確認中…", style="Hint.TLabel",
+                                           wraplength=700)
+        self.vocal_setup_label.grid(row=0, column=0, sticky="w")
+        self.vocal_setup_button = ttk.Button(vocal, text="有効にする", state="disabled")
+        self.vocal_setup_button.grid(row=0, column=1, padx=8)
+        self.vocal_progress = ttk.Progressbar(vocal, maximum=100)
+        self.vocal_progress.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        self.vocal_progress.grid_remove()  # 取得中だけ出す
+
         storage = ttk.Frame(tab)
-        storage.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        storage.grid(row=4, column=0, sticky="ew", pady=(10, 0))
         self.cache_label = ttk.Label(storage, text="作成したオフボーカル: 確認中…",
                                      style="Hint.TLabel")
         self.cache_label.pack(side="left")
@@ -409,7 +421,7 @@ class KaraokeApp(tk.Tk):
         self.after(1200, self._update_cache_label)
 
         ttk.Label(tab, text=f"設定の保存先: {config.CONFIG_PATH}", style="Hint.TLabel").grid(
-            row=4, column=0, sticky="w", pady=(6, 0))
+            row=5, column=0, sticky="w", pady=(6, 0))
 
     # ---------- VST3 タブ ----------
     def _build_vst_tab(self) -> None:
@@ -676,6 +688,16 @@ class KaraokeApp(tk.Tk):
             "（数十秒かかります。あとから「自動設定」でやり直せます）",
         ):
             self.auto_setup()
+        # 機器を選び終えたころに、ボーカル除去を使えるなら案内する
+        self.after(6000, self._offer_model_on_first_run)
+
+    def _offer_model_on_first_run(self) -> None:
+        cap = self.separator_capability
+        if cap is None:  # 判定がまだ終わっていない
+            self.after(3000, self._offer_model_on_first_run)
+            return
+        if not cap.available and getattr(cap, "installable", False):
+            self.offer_model_install()
 
     # ================= マイク =================
     def toggle_mic(self) -> None:
@@ -1169,19 +1191,128 @@ class KaraokeApp(tk.Tk):
 
     def _apply_separator_capability(self, cap) -> None:
         self.separator_capability = cap
+        installable = getattr(cap, "installable", False)
         if cap.available:
             self.vocal_button.configure(state="normal")
             self.vocal_hint.configure(text=f"（{cap.gpu_name} で作成できます）")
+        elif installable:
+            # 機器は対応している。押されたら取得を案内する
+            self.vocal_button.configure(state="normal")
+            self.vocal_hint.configure(text=f"（{cap.gpu_name} で使えます。初回のみ準備が必要）")
         else:
             self.vocal_button.configure(state="disabled")
             self.vocal_hint.configure(text=f"（{cap.reason}）")
+        self._update_vocal_setup_ui()
+
+    # ---------- AI ボーカル除去の導入 ----------
+    def _update_vocal_setup_ui(self) -> None:
+        """設定タブ側の表示を、いまの状態に合わせる。"""
+        if not hasattr(self, "vocal_setup_label"):
+            return
+        import model_installer
+
+        cap = self.separator_capability
+        busy = getattr(self, "_installing", False)
+        if cap is None:
+            self.vocal_setup_label.configure(text="確認中…")
+            self.vocal_setup_button.configure(state="disabled")
+            return
+        if cap.available:
+            size = model_installer.installed_size_mb()
+            where = f"（追加で入れたぶん {size:.0f} MB）" if size else "（同梱ぶんで動作中）"
+            self.vocal_setup_label.configure(text=f"使えます: {cap.summary} {where}")
+            self.vocal_setup_button.configure(
+                text="削除する", state="disabled" if busy or not size else "normal",
+                command=self.remove_model)
+        elif getattr(cap, "installable", False):
+            self.vocal_setup_label.configure(
+                text=f"{cap.gpu_name} で使えます。有効にするには約 3 GB の取得が必要です。")
+            self.vocal_setup_button.configure(
+                text="有効にする", state="disabled" if busy else "normal",
+                command=self.offer_model_install)
+        else:
+            self.vocal_setup_label.configure(text=f"この PC では使えません: {cap.reason}")
+            self.vocal_setup_button.configure(state="disabled")
+
+    def offer_model_install(self) -> None:
+        cap = self.separator_capability
+        if cap is None or cap.available:
+            return
+        if not messagebox.askyesno(
+            APP_TITLE,
+            f"AI によるボーカル除去を有効にします。\n\n"
+            f"　使う機器: {cap.gpu_name}\n"
+            f"　取得する量: 約 3 GB\n"
+            f"　かかる時間: 回線によって 5〜30 分ほど\n\n"
+            "この間もアプリは使えます。始めますか？",
+        ):
+            return
+        self.start_model_install()
+
+    def start_model_install(self) -> None:
+        import model_installer
+
+        self._installing = True
+        self._install_cancel = threading.Event()
+        self._update_vocal_setup_ui()
+        self.vocal_progress.grid()
+        self.vocal_progress["value"] = 0
+
+        def report(stage: str, ratio: float, detail: str = "") -> None:
+            self.post(self._show_install_progress, stage, ratio, detail)
+
+        def work():
+            model_installer.install(progress=report, cancel=self._install_cancel)
+            return separator_capability_after_install()
+
+        def separator_capability_after_install():
+            import separator
+            return separator.capability(refresh=True)
+
+        self.run_async(work, self._finish_model_install,
+                       busy_text="ボーカル除去の準備をしています…")
+
+    def _show_install_progress(self, stage: str, ratio: float, detail: str) -> None:
+        self.vocal_progress["value"] = ratio * 100
+        self.vocal_setup_label.configure(text=f"{stage}… {detail}")
+        self.status_label.configure(text=f"ボーカル除去の準備: {stage} {ratio*100:.0f}%")
+
+    def _finish_model_install(self, cap) -> None:
+        self._installing = False
+        self.vocal_progress.grid_remove()
+        self._apply_separator_capability(cap)
+        messagebox.showinfo(
+            APP_TITLE,
+            "ボーカル除去を有効にしました。\n"
+            "曲を選んで「ボーカルを消す」を押すと使えます。\n"
+            "（最初の 1 曲目だけ、AI モデルの取得で少し余分に時間がかかります）"
+            if cap.available else
+            f"有効にできませんでした:\n{cap.reason}")
+
+    def remove_model(self) -> None:
+        import model_installer
+        import separator
+
+        size = model_installer.installed_size_mb()
+        if not messagebox.askyesno(
+                APP_TITLE, f"ボーカル除去のために入れたもの（{size:.0f} MB）を削除しますか？"):
+            return
+        removed = model_installer.uninstall()
+        self._apply_separator_capability(separator.capability(refresh=True))
+        self.status_label.configure(text=f"{removed} MB を削除しました")
 
     def remove_vocals(self) -> None:
         """選んだ曲のボーカルを消して、そのまま再生する。"""
         cap = getattr(self, "separator_capability", None)
-        if cap is None or not cap.available:
-            messagebox.showinfo(APP_TITLE, "この PC ではボーカル除去を使えません。\n"
-                                           f"{cap.reason if cap else ''}")
+        if cap is None:
+            return
+        if not cap.available:
+            if getattr(cap, "installable", False):
+                self.notebook.select(3)  # 設定・診断タブへ案内する
+                self.offer_model_install()
+            else:
+                messagebox.showinfo(APP_TITLE,
+                                    f"この PC ではボーカル除去を使えません。\n{cap.reason}")
             return
 
         import separator

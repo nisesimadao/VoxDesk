@@ -14,6 +14,9 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import os
+import platform
+import shutil
+import subprocess
 import sys
 import threading
 import wave
@@ -33,6 +36,33 @@ FAST_MODEL = "htdemucs"
 HQ_MODEL = "htdemucs_ft"
 
 CACHE_DIR = os.path.join(platform_support.cache_dir(), "offvocal")
+# あとから入れた torch / demucs の置き場所。インストーラ版には site-packages が
+# 無いので、書き込める場所へ入れて読み込み先に足す。
+RUNTIME_DIR = os.path.join(platform_support.app_data_dir(), "runtime")
+
+if os.path.isdir(RUNTIME_DIR) and RUNTIME_DIR not in sys.path:
+    sys.path.insert(0, RUNTIME_DIR)
+
+
+@dataclass
+class Hardware:
+    """torch を入れなくても分かる範囲の機器情報。
+
+    「入れれば使えるのか、そもそも無理なのか」を、部品を入れる前に判断するために使う。
+    """
+
+    kind: str = ""          # "cuda" / "mps" / ""
+    gpu_name: str = ""
+    vram_gb: float = 0.0
+    ram_gb: float = 0.0
+    eligible: bool = False  # 部品を入れれば使えるか
+    reason: str = ""
+
+    @property
+    def model(self) -> str:
+        if self.kind == "cuda":
+            return HQ_MODEL if self.vram_gb >= HQ_VRAM_GB else FAST_MODEL
+        return HQ_MODEL if self.ram_gb >= MPS_HQ_RAM_GB else FAST_MODEL
 
 
 @dataclass
@@ -45,13 +75,16 @@ class Capability:
     gpu_name: str = ""
     vram_gb: float = 0.0
     model: str = FAST_MODEL
+    installable: bool = False  # 部品を入れれば使えるようになるか
 
     @property
     def summary(self) -> str:
-        if not self.available:
-            return f"使えません — {self.reason}"
-        quality = "高品質" if self.model == HQ_MODEL else "標準"
-        return f"{self.gpu_name}（{self.vram_gb:.0f} GB）で使えます / {quality}モデル"
+        if self.available:
+            quality = "高品質" if self.model == HQ_MODEL else "標準"
+            return f"{self.gpu_name}（{self.vram_gb:.0f} GB）で使えます / {quality}モデル"
+        if self.installable:
+            return f"{self.gpu_name} で使えます（有効にするには追加の入手が必要）"
+        return f"使えません — {self.reason}"
 
 
 _capability: Capability | None = None
@@ -79,6 +112,57 @@ def _total_ram_gb() -> float:
         return 0.0
 
 
+def hardware_probe() -> Hardware:
+    """torch を入れずに、この PC で使えそうかを調べる。
+
+    NVIDIA は nvidia-smi（ドライバに必ず付いてくる）に聞く。
+    Apple Silicon は機種情報とメモリ量で判断する。
+    """
+    ram = _total_ram_gb()
+
+    if platform_support.MACOS and platform.machine() == "arm64":
+        if ram and ram < MPS_MIN_RAM_GB:
+            return Hardware(
+                kind="mps", gpu_name="Apple Silicon GPU", ram_gb=ram,
+                reason=f"メモリが足りません（{ram:.0f} GB / {MPS_MIN_RAM_GB:.0f} GB 以上必要）")
+        return Hardware(kind="mps", gpu_name="Apple Silicon GPU", ram_gb=ram, eligible=True)
+
+    smi = shutil.which("nvidia-smi")
+    if not smi:
+        return Hardware(
+            ram_gb=ram,
+            reason="対応する GPU が見つかりません"
+                   "（NVIDIA の CUDA 対応 GPU か、Apple Silicon の Mac が必要です）")
+    try:
+        output = subprocess.run(
+            [smi, "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=15,
+            creationflags=subprocess.CREATE_NO_WINDOW if platform_support.WINDOWS else 0,
+        ).stdout.strip()
+    except Exception as e:
+        return Hardware(ram_gb=ram, reason=f"GPU を調べられませんでした（{type(e).__name__}）")
+
+    first = next((line for line in output.splitlines() if line.strip()), "")
+    if not first:
+        return Hardware(ram_gb=ram, reason="GPU の情報を取得できませんでした")
+    name, _, memory = first.partition(",")
+    try:
+        vram = float(memory.strip()) / 1024.0  # nvidia-smi は MiB で返す
+    except ValueError:
+        vram = 0.0
+
+    gpu = name.strip()
+    if vram < MIN_VRAM_GB:
+        return Hardware(kind="cuda", gpu_name=gpu, vram_gb=vram, ram_gb=ram,
+                        reason=f"GPU のメモリが足りません"
+                               f"（{vram:.1f} GB / {MIN_VRAM_GB:.0f} GB 以上必要）")
+    if ram and ram < MIN_RAM_GB:
+        return Hardware(kind="cuda", gpu_name=gpu, vram_gb=vram, ram_gb=ram,
+                        reason=f"メモリが足りません"
+                               f"（{ram:.1f} GB / {MIN_RAM_GB:.0f} GB 以上必要）")
+    return Hardware(kind="cuda", gpu_name=gpu, vram_gb=vram, ram_gb=ram, eligible=True)
+
+
 def capability(refresh: bool = False) -> Capability:
     """使えるかどうかを判定する。torch の import が重いので結果を覚えておく。"""
     global _capability
@@ -90,14 +174,27 @@ def capability(refresh: bool = False) -> Capability:
 
 
 def _detect() -> Capability:
+    missing = None
     try:
         import torch
     except ImportError:
-        return Capability(False, "ボーカル除去に必要な部品（torch）が入っていません")
-    try:
-        import demucs.pretrained  # noqa: F401
-    except ImportError:
-        return Capability(False, "ボーカル除去に必要な部品（demucs）が入っていません")
+        missing = "torch"
+    else:
+        try:
+            import demucs.pretrained  # noqa: F401
+        except ImportError:
+            missing = "demucs"
+
+    if missing:
+        # 部品が無いときは、機器の側だけを見て「入れれば使えるか」を答える
+        hardware = hardware_probe()
+        if hardware.eligible:
+            return Capability(
+                False, f"{missing} が入っていません", gpu_name=hardware.gpu_name,
+                vram_gb=hardware.vram_gb or hardware.ram_gb, model=hardware.model,
+                installable=True,
+            )
+        return Capability(False, hardware.reason or f"{missing} が入っていません")
 
     ram = _total_ram_gb()
 
