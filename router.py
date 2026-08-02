@@ -81,7 +81,7 @@ class Resampler:
 class RingBuffer:
     """単一の生産者と単一の消費者を想定した float32 のリングバッファ。"""
 
-    def __init__(self, capacity: int):
+    def __init__(self, capacity: int, target: int = 0):
         self._buf = np.zeros(capacity, dtype=np.float32)
         self._capacity = capacity
         self._read = 0
@@ -90,6 +90,12 @@ class RingBuffer:
         self._lock = threading.Lock()
         self.overruns = 0
         self.underruns = 0
+        # 溢れたときに、ここまで捨てて遅延を戻す。
+        # 目標を指定しないときは切り詰めない（ただの循環バッファとして使える）
+        self.target = target
+        # ここを超えたら捨てる。満杯まで待つと最大遅延に張り付き、
+        # ドリフト補正（最大 0.3%）では戻すのに何分もかかってしまう
+        self.max_fill = min(capacity, max(target * 4, target + 1)) if target else capacity
 
     @property
     def fill(self) -> int:
@@ -104,9 +110,11 @@ class RingBuffer:
         if n == 0:
             return
         with self._lock:
-            if n > self._capacity - self._fill:
-                # 溢れた分は古い側を捨てる（遅延を増やさない）
-                drop = n - (self._capacity - self._fill)
+            if self._fill + n > self.max_fill:
+                # 溜まりすぎたら目標量まで一気に捨てて、遅延をその場で戻す。
+                # 「入る分だけ捨てる」では満杯に張り付いたままになる。
+                keep = max(0, min(self._fill, self.target - n))
+                drop = self._fill - keep
                 self._read = (self._read + drop) % self._capacity
                 self._fill -= drop
                 self.overruns += 1
@@ -244,19 +252,30 @@ class Router:
             out_rate = int(out_info["default_samplerate"])
             out_channels = min(2, max(1, out_info["max_output_channels"]))
 
-            ring = RingBuffer(int(out_rate * 2.0))  # 最大 2 秒
             target_fill = int(out_rate * buffer_ms / 1000.0)
+            ring = RingBuffer(int(out_rate * 2.0), target=target_fill)  # 最大 2 秒
             resampler = Resampler(in_rate, out_rate) if in_rate != out_rate else None
 
-            in_stream = sd.InputStream(
-                device=in_device, samplerate=in_rate, channels=1, dtype="float32",
-                latency=latency, blocksize=blocksize, callback=self._input_callback,
-            )
-            out_stream = sd.OutputStream(
-                device=out_device, samplerate=out_rate, channels=out_channels,
-                dtype="float32", latency=latency, blocksize=blocksize,
-                callback=self._output_callback,
-            )
+            in_stream = out_stream = None
+            try:
+                in_stream = sd.InputStream(
+                    device=in_device, samplerate=in_rate, channels=1, dtype="float32",
+                    latency=latency, blocksize=blocksize, callback=self._input_callback,
+                )
+                out_stream = sd.OutputStream(
+                    device=out_device, samplerate=out_rate, channels=out_channels,
+                    dtype="float32", latency=latency, blocksize=blocksize,
+                    callback=self._output_callback,
+                )
+            except Exception:
+                # 片方だけ開けた状態で失敗すると、そのストリームが閉じられずに残る
+                for stream in (in_stream, out_stream):
+                    if stream is not None:
+                        try:
+                            stream.close()
+                        except Exception:
+                            pass
+                raise
 
             if generation != self._generation:  # 開いている間に停止された
                 in_stream.close(); out_stream.close()

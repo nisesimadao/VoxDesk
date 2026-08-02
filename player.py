@@ -163,10 +163,11 @@ class AVPlayer:
                 return
 
             self._n_decoders = len(decoders)
+            stop_evt = self._stop_evt  # この再生ぶんの停止合図を捕まえておく
             for container, source, do_video, do_audio in decoders:
                 t = threading.Thread(
                     target=self._decode_worker,
-                    args=(container, source, headers, do_video, do_audio),
+                    args=(container, source, headers, do_video, do_audio, stop_evt),
                     daemon=True,
                 )
                 t.start()
@@ -262,15 +263,19 @@ class AVPlayer:
 
     # ---------- デコード ----------
     def _decode_worker(self, container, source: str, headers: dict,
-                       do_video: bool, do_audio: bool) -> None:
+                       do_video: bool, do_audio: bool, stop_evt: threading.Event) -> None:
         """1 本のソースをデコードし続ける。
 
         コンテナは自分で開き直し、自分で閉じる。他スレッドから閉じると
         読み込み中のメモリを触って落ちるため、所有権はこのスレッドにある。
+
+        停止合図は引数で受け取る。self から読むと、次の曲が始まったときに
+        差し替えられた新しい合図を見てしまい、止めたはずのスレッドが
+        次の曲のバッファへ混ざり込む。
         """
         state = {"container": container}
         try:
-            self._decode_loop(state, source, headers, do_video, do_audio)
+            self._decode_loop(state, source, headers, do_video, do_audio, stop_evt)
         finally:
             try:
                 if state["container"] is not None:
@@ -294,7 +299,8 @@ class AVPlayer:
         return streams, resampler
 
     def _decode_loop(self, state: dict, source: str, headers: dict,
-                     do_video: bool, do_audio: bool) -> None:
+                     do_video: bool, do_audio: bool,
+                     stop_evt: threading.Event) -> None:
         try:
             container = state["container"]
             streams, resampler = self._prepare(container, do_video, do_audio)
@@ -302,12 +308,12 @@ class AVPlayer:
                 self._eof += 1
                 return
 
-            while not self._stop_evt.is_set():
+            while not stop_evt.is_set():
                 gen = self._gen
                 completed = True
                 try:
                     for packet in container.demux(*streams):
-                        if self._stop_evt.is_set():
+                        if stop_evt.is_set():
                             return
                         if self._gen != gen:
                             completed = False
@@ -317,7 +323,7 @@ class AVPlayer:
                         except av.FFmpegError:
                             continue
                         for frame in frames:
-                            if self._stop_evt.is_set():
+                            if stop_evt.is_set():
                                 return
                             if isinstance(frame, av.VideoFrame):
                                 self._push_video(frame, gen)
@@ -337,9 +343,9 @@ class AVPlayer:
                     self._eof += 1
                     # ここで抜けるとコンテナが閉じてしまい、あとから巻き戻せなくなる。
                     # 曲の終わりから聴き直すのはよくある操作なので、シークを待つ。
-                    while not self._stop_evt.is_set() and self._gen == gen:
+                    while not stop_evt.is_set() and self._gen == gen:
                         time.sleep(0.05)
-                    if self._stop_evt.is_set():
+                    if stop_evt.is_set():
                         return
                     # 最後まで読んだコンテナはシークしても EOF のままになるので開き直す
                     container = self._reopen(state, source, headers)
@@ -356,7 +362,7 @@ class AVPlayer:
                     streams, resampler = self._prepare(container, do_video, do_audio)
                     container.seek(int(target * av.time_base))
         except Exception as e:
-            if not self._stop_evt.is_set():
+            if not stop_evt.is_set():
                 self.state = "error"
                 if self.on_error:
                     self.on_error(e)

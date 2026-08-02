@@ -27,12 +27,11 @@ jobs:
           - os: windows-latest
             label: Windows
             artifact: windows
+          # Intel Mac 向けは作らない。ランナーの費用が高く、需要も減っているため。
+          # 必要な人は build.sh でソースから作れる。
           - os: macos-15
             label: macOS (Apple Silicon)
             artifact: macos-arm64
-          - os: macos-15-intel
-            label: macOS (Intel)
-            artifact: macos-x86_64
           - os: ubuntu-22.04
             label: Linux
             artifact: linux
@@ -135,8 +134,9 @@ jobs:
             |---|---|---|
             | Windows | `*-windows-x64-setup.exe` | 実行してインストール |
             | macOS (Apple Silicon) | `*-macos-arm64.dmg` | 開いて Applications へドラッグ |
-            | macOS (Intel) | `*-macos-x86_64.dmg` | 同上 |
             | Linux | `*-linux-x86_64.tar.gz` | 展開して `./VoxDesk` |
+
+            Intel Mac 向けは配布していません。`./build.sh` でソースから作れます。
 
             ### macOS で「開発元を確認できない」と出たら
 

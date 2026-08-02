@@ -119,6 +119,102 @@ class VstSlot:
                 continue
 
 
+class RNNoiseDenoiser:
+    """RNNoise（Xiph）による音声向けノイズ除去。
+
+    ニューラルネットと従来の信号処理を組み合わせた軽量な手法で、
+    定常ノイズだけでなくキーボードの打鍵音のような突発音も落とせる。
+    48kHz・10ms（480 サンプル）単位で動くため、内部で貯めてから渡す。
+
+    pyrnnoise が同梱する ctypes バインディングだけを直接読み込む。
+    パッケージの __init__ は音声ファイル読み書き用の重い依存
+    （audiolab）を引き込み、現行の PyAV と衝突するため通さない。
+    """
+
+    RATE = 48000
+    _module = None
+    _load_error = ""
+
+    @classmethod
+    def _binding(cls):
+        if cls._module is not None or cls._load_error:
+            return cls._module
+        try:
+            import importlib.util
+
+            spec = importlib.util.find_spec("pyrnnoise")
+            if spec is None or not spec.submodule_search_locations:
+                raise ImportError("pyrnnoise が入っていません")
+            path = os.path.join(list(spec.submodule_search_locations)[0], "rnnoise.py")
+            if not os.path.exists(path):
+                raise ImportError("rnnoise の binding が見つかりません")
+            sub = importlib.util.spec_from_file_location("_voxdesk_rnnoise", path)
+            module = importlib.util.module_from_spec(sub)
+            sub.loader.exec_module(module)
+            cls._module = module
+        except Exception as e:
+            cls._load_error = f"{type(e).__name__}: {e}"
+        return cls._module
+
+    @classmethod
+    def available(cls) -> bool:
+        return cls._binding() is not None
+
+    @classmethod
+    def unavailable_reason(cls) -> str:
+        cls._binding()
+        return cls._load_error
+
+    def __init__(self, rate: int):
+        module = self._binding()
+        if module is None:
+            raise RuntimeError(self._load_error or "RNNoise を使えません")
+        self.rate = rate
+        self.frame = int(module.FRAME_SIZE)
+        self._module = module
+        self._state = module.create()
+        self._in = np.zeros(0, dtype=np.float32)
+        self._out = np.zeros(0, dtype=np.float32)
+        self.speech_probability = 0.0
+
+    @property
+    def latency_ms(self) -> float:
+        return 1000.0 * self.frame / self.RATE
+
+    def process(self, x: np.ndarray) -> np.ndarray:
+        self._in = np.concatenate([self._in, x.astype(np.float32)])
+        while len(self._in) >= self.frame:
+            block = np.clip(self._in[: self.frame], -1.0, 1.0)
+            cleaned, probability = self._module.process_mono_frame(self._state, block)
+            self.speech_probability = float(probability)
+            self._out = np.concatenate(
+                [self._out, cleaned.astype(np.float32) / 32767.0])
+            self._in = self._in[self.frame:]
+
+        take = len(x)
+        if len(self._out) < take:  # 貯まるまでは無音を返す（最大 10ms）
+            self._out = np.concatenate(
+                [np.zeros(take - len(self._out), dtype=np.float32), self._out])
+        y = self._out[:take].copy()
+        self._out = self._out[take:]
+        return y
+
+    def reset_buffers(self) -> None:
+        self._in = np.zeros(0, dtype=np.float32)
+        self._out = np.zeros(0, dtype=np.float32)
+
+    def close(self) -> None:
+        if getattr(self, "_state", None) is not None:
+            self._module.destroy(self._state)
+            self._state = None
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
 class SpectralDenoiser:
     """スペクトル減算による定常ノイズ除去。
 
@@ -134,10 +230,17 @@ class SpectralDenoiser:
         self.hop = n_fft // 2
         self.strength = strength
         self.floor = 10.0 ** (floor_db / 20.0)
-        self.window = np.hanning(n_fft + 1)[:-1].astype(np.float32)  # 周期窓（COLA）
+        # 分析と合成の両方で掛けるので、平方根をとった窓を使う。
+        # ハン窓をそのまま 2 回掛けると重ね合わせが 0.5〜1.0 で脈打ち、
+        # 音が震える（ハン窓の 2 乗は 50% 重ねでは一定にならない）。
+        self.window = np.sqrt(np.hanning(n_fft + 1)[:-1]).astype(np.float32)
         bins = n_fft // 2 + 1
         self._in = np.zeros(0, dtype=np.float32)
-        self._out = np.zeros(n_fft, dtype=np.float32)
+        # 足し合わせ用（常に n_fft 長）と、書き出し待ちの列を分ける。
+        # 1 つのバッファで兼ねると、呼び出しごとのブロック長に応じて
+        # 足し込む位置がずれ、音量が周期的に揺れる。
+        self._acc = np.zeros(n_fft, dtype=np.float32)
+        self._ready = np.zeros(0, dtype=np.float32)
         self._prev_gain = np.ones(bins, dtype=np.float32)
         self._learning = False
         self._learn_acc = np.zeros(bins, dtype=np.float32)
@@ -178,7 +281,8 @@ class SpectralDenoiser:
     def reset_buffers(self) -> None:
         """入出力バッファだけ捨てる。学習したノイズプロファイルは残す。"""
         self._in = np.zeros(0, dtype=np.float32)
-        self._out = np.zeros(self.n_fft, dtype=np.float32)
+        self._acc = np.zeros(self.n_fft, dtype=np.float32)
+        self._ready = np.zeros(0, dtype=np.float32)
         self._prev_gain[:] = 1.0
 
     def process(self, x: np.ndarray) -> np.ndarray:
@@ -206,19 +310,22 @@ class SpectralDenoiser:
                 gain = 0.5 * gain + 0.5 * self._prev_gain
                 self._prev_gain = gain
 
-            self._out[-self.n_fft:] += (np.fft.irfft(spec * gain) * self.window).astype(
-                np.float32
+            self._acc += (np.fft.irfft(spec * gain) * self.window).astype(np.float32)
+            # 先頭 hop サンプルは重ね合わせが済んだので払い出し、残りを前へ詰める
+            self._ready = np.concatenate([self._ready, self._acc[: self.hop].copy()])
+            self._acc = np.concatenate(
+                [self._acc[self.hop:], np.zeros(self.hop, dtype=np.float32)]
             )
             self._in = self._in[self.hop:]
-            self._out = np.concatenate([self._out, np.zeros(self.hop, dtype=np.float32)])
 
         take = len(x)
-        y = self._out[:take].copy()
-        self._out = self._out[take:]
-        if len(self._out) < self.n_fft:
-            self._out = np.concatenate(
-                [self._out, np.zeros(self.n_fft - len(self._out), dtype=np.float32)]
-            )
+        if len(self._ready) < take:  # 貯まるまで（最初の n_fft ぶん）は無音を返す
+            y = np.zeros(take, dtype=np.float32)
+            y[take - len(self._ready):] = self._ready
+            self._ready = np.zeros(0, dtype=np.float32)
+            return y
+        y = self._ready[:take].copy()
+        self._ready = self._ready[take:]
         return y
 
 
@@ -245,6 +352,8 @@ class MicChain:
         self.limiter = Limiter(threshold_db=-1.0, release_ms=100.0)
 
         self.denoiser = SpectralDenoiser(rate)
+        self.denoise_engine = "spectral"  # spectral / rnnoise
+        self.rnnoise: RNNoiseDenoiser | None = None
         self._vst: list[VstSlot] = []
         self._board = Pedalboard([])
         self._lock = threading.Lock()
@@ -363,7 +472,10 @@ class MicChain:
 
         y = x.astype(np.float32)
         if self.denoise:
-            y = self.denoiser.process(y)
+            if self.denoise_engine == "rnnoise" and self.rnnoise is not None:
+                y = self.rnnoise.process(y)
+            else:
+                y = self.denoiser.process(y)
         with self._lock:
             board = self._board
         # reset=False で内部状態を保持し、ブロックをまたいで連続処理する
@@ -383,6 +495,19 @@ class MicChain:
         """学習を確定する。十分なデータが集まっていれば True。"""
         return self.denoiser.stop_learning()
 
+    def set_denoise_engine(self, name: str) -> None:
+        """ノイズ除去の方式を切り替える。使えないときは例外を投げる。"""
+        if name == "rnnoise":
+            if self.rate != RNNoiseDenoiser.RATE:
+                raise RuntimeError(
+                    f"RNNoise は 48kHz のマイクでのみ使えます（今は {self.rate}Hz）")
+            if self.rnnoise is None:
+                self.rnnoise = RNNoiseDenoiser(self.rate)
+        elif self.rnnoise is not None:
+            self.rnnoise.close()
+            self.rnnoise = None
+        self.denoise_engine = name
+
     def set_rate(self, rate: int) -> None:
         """入力デバイスのサンプルレートに合わせる。ノイズ除去器は作り直す。"""
         if rate == self.rate:
@@ -390,6 +515,13 @@ class MicChain:
         self.rate = rate
         strength = self.denoiser.strength
         self.denoiser = SpectralDenoiser(rate, strength=strength)
+        if self.rnnoise is not None:  # 48kHz 以外では使えないので作り直す
+            self.rnnoise.close()
+            self.rnnoise = None
+            if rate == RNNoiseDenoiser.RATE:
+                self.rnnoise = RNNoiseDenoiser(rate)
+            else:
+                self.denoise_engine = "spectral"
         self.reset()
 
     def reset(self) -> None:

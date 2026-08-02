@@ -48,14 +48,36 @@ Windows / macOS / Linux · MIT License
 |---|---|---|
 | Windows | `*-windows-x64-setup.exe` | 実行するだけ |
 | macOS (Apple Silicon) | `*-macos-arm64.dmg` | 開いて Applications へ入れる |
-| macOS (Intel) | `*-macos-x86_64.dmg` | 同上 |
 | Linux | `*-linux-x86_64.tar.gz` | 展開して `./VoxDesk` |
 
 macOS は署名していないので、初回だけ右クリック →「開く」。
 Linux は `sudo apt install libportaudio2` が要る。
 
-ソースから動かすなら、Windows は `VoxDesk を起動.bat`、
-macOS / Linux は `chmod +x start.sh && ./start.sh`。初回だけ準備に数分かかる。
+**Intel Mac 向けは配布していない。**下の「自分で作る」で作れる。
+
+## 動かす（ソースから）
+
+```
+git clone https://github.com/nisesimadao/VoxDesk.git
+cd VoxDesk
+```
+
+Windows は `VoxDesk を起動.bat`、macOS / Linux は `chmod +x start.sh && ./start.sh`。
+初回だけ準備に数分かかる。
+
+## 自分で作る
+
+配布物と同じものを手元で作れる。Intel Mac はこちら。
+
+```
+./build.sh          # macOS / Linux
+.\build.ps1         # Windows
+```
+
+Python・tkinter・PortAudio の有無を確かめ、仮想環境を作り、
+アイコンを生成して、`dist/` に一式を出す。
+macOS なら dmg、Linux なら tar.gz、Windows は Inno Setup があればインストーラまで作る。
+版を付けたいときは `./build.sh 1.2.0` のように渡す。
 
 ## 使う
 

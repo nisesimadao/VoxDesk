@@ -23,6 +23,7 @@ import separator
 # CUDA 版の torch は PyPI ではなく専用の配布元から取る
 CUDA_INDEX = "https://download.pytorch.org/whl/cu126"
 APPROX_TOTAL_MB = 3000.0  # 進捗表示の目安
+RNNOISE_MB = 15.0
 
 
 def target_dir() -> str:
@@ -152,6 +153,24 @@ def _run_pip(command: list[str], label: str, progress, cancel: threading.Event,
 
     if process.returncode != 0:
         raise RuntimeError(f"{label} に失敗しました: {' / '.join(tail[-3:]) or '原因不明'}")
+
+
+def install_rnnoise(progress=None) -> None:
+    """RNNoise（音声向けノイズ除去）の部品を入れる。約 15 MB。
+
+    pyrnnoise は音声ファイル読み書き用に重い依存を持つが、こちらが使うのは
+    同梱の ctypes バインディングだけなので --no-deps で入れる。
+    依存を入れると現行の PyAV と衝突して壊れる。
+    """
+    python, problem = find_python()
+    if python is None:
+        raise RuntimeError(problem)
+    os.makedirs(target_dir(), exist_ok=True)
+    command = [python, "-m", "pip", "install", "--upgrade", "--no-deps",
+               "--target", target_dir(), "--disable-pip-version-check", "pyrnnoise"]
+    _run_pip(command, "RNNoise を取得中", progress, threading.Event(), base=0.0, span=1.0)
+    if target_dir() not in sys.path:
+        sys.path.insert(0, target_dir())
 
 
 def uninstall() -> int:

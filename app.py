@@ -76,11 +76,13 @@ PRESETS = {
 
 # ノイズ除去の強さ。0 で無効、負の値はマイク側（RTX Voice など）に任せる印
 AI_MIC_MODE = "マイク側で処理（RTX Voice / Krisp など）"
+RNNOISE_MODE = "AI（RNNoise・話し声向け）"
 DENOISE_MODES = {
     "なし": 0.0,
     "弱め": 0.8,
     "標準": 1.5,
     "強め": 2.5,
+    RNNOISE_MODE: -2.0,
     AI_MIC_MODE: -1.0,
 }
 
@@ -347,17 +349,17 @@ class KaraokeApp(tk.Tk):
                               state="readonly")
         preset.grid(row=0, column=1, sticky="ew", padx=8, pady=(0, 8))
         preset.bind("<<ComboboxSelected>>", lambda _e: self.apply_preset())
-        ttk.Button(fx, text="ノイズを学習", command=self.learn_noise).grid(row=0, column=2)
-
         self.fx_vars: dict[str, tk.Variable] = {}
         self.fx_labels: dict[str, tuple[ttk.Label, str]] = {}
         ttk.Label(fx, text="ノイズ除去").grid(row=0, column=2, sticky="e", padx=(12, 0))
         self.denoise_mode_var = tk.StringVar(
             value=self.cfg["effects"].get("denoise_mode", "標準"))
         denoise_box = ttk.Combobox(fx, textvariable=self.denoise_mode_var,
-                                   values=list(DENOISE_MODES), state="readonly", width=18)
+                                   values=list(DENOISE_MODES), state="readonly", width=24)
         denoise_box.grid(row=0, column=3, sticky="w", padx=(6, 0), pady=(0, 8))
         denoise_box.bind("<<ComboboxSelected>>", lambda _e: self.apply_denoise_mode())
+        ttk.Button(fx, text="ノイズを学習", command=self.learn_noise).grid(
+            row=0, column=4, padx=(8, 0), pady=(0, 8))
 
         rows = [
             ("input_gain_db", "マイクの音量", -10.0, 40.0, "dB"),
@@ -754,6 +756,9 @@ class KaraokeApp(tk.Tk):
         if mic is None or out is None:
             messagebox.showwarning(APP_TITLE, "マイクと出力先を選んでください。")
             return
+        # 先に止めてから作り直す。動いているコールバックの裏で
+        # ノイズ除去器やプラグインの状態を差し替えると壊れる
+        self.router.stop()
         self.chain.set_rate(mic.rate)
         self.router.start(
             mic.index, out.index,
@@ -820,15 +825,53 @@ class KaraokeApp(tk.Tk):
         strength = DENOISE_MODES.get(mode, 1.5)
         self.cfg["effects"]["denoise_mode"] = mode
 
-        if strength < 0:  # マイク側の機能に任せる
+        if strength == -1.0:  # マイク側の機能に任せる
+            self.chain.set_denoise_engine("spectral")
             self.chain.denoise = False
             self._offer_ai_microphone()
+        elif strength == -2.0:  # RNNoise
+            if not self._enable_rnnoise():
+                return
         else:
+            self.chain.set_denoise_engine("spectral")
             self.chain.denoise = strength > 0
             if strength > 0:
                 self.chain.denoiser.strength = strength
                 self.cfg["effects"]["denoise_strength"] = strength
         self.cfg["effects"]["denoise"] = self.chain.denoise
+
+    def _enable_rnnoise(self) -> bool:
+        """RNNoise に切り替える。使えなければ取得を案内して False を返す。"""
+        import model_installer
+
+        if not mic_chain.RNNoiseDenoiser.available():
+            if not messagebox.askyesno(
+                APP_TITLE,
+                "RNNoise（音声向けのノイズ除去）を使うには、\n"
+                "追加の部品が必要です（約 15 MB）。\n\n"
+                "キーボードの打鍵音のような突発的な音にも効きます。\n"
+                "今すぐ取得しますか？",
+            ):
+                self._sync_denoise_mode()
+                return False
+            try:
+                self.status_label.configure(text="RNNoise を取得しています…")
+                self.update_idletasks()
+                model_installer.install_rnnoise()
+            except Exception as e:
+                messagebox.showerror(APP_TITLE, f"取得できませんでした:\n{e}")
+                self._sync_denoise_mode()
+                return False
+        try:
+            self.chain.set_denoise_engine("rnnoise")
+        except Exception as e:
+            messagebox.showinfo(APP_TITLE, str(e))
+            self._sync_denoise_mode()
+            return False
+        self.chain.denoise = True
+        self.cfg["effects"]["denoise"] = True
+        self.status_label.configure(text="RNNoise に切り替えました")
+        return True
 
     def _offer_ai_microphone(self) -> None:
         """RTX Voice や Krisp の仮想マイクがあれば、そちらへ切り替える。"""
