@@ -1,0 +1,8 @@
+# ボーカル除去（任意）。合計 3 GB ほどあるので、必要な人だけ入れる。
+#
+#   .\.venv\Scripts\python.exe -m pip install torch --index-url https://download.pytorch.org/whl/cu126
+#   .\.venv\Scripts\python.exe -m pip install -r requirements-vocal.txt
+#
+# torch は CUDA 版を上の行で先に入れること。ここで入れると CPU 版になり、
+# アプリ側の判定で「対応する GPU が見つかりません」となって機能が無効化される。
+demucs>=4.0

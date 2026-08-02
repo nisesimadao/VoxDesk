@@ -1,0 +1,19 @@
+# 仮想環境（4 GB 以上あるので入れない。requirements.txt から作り直せる）
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# アプリが作るもの
+*.wav
+!docs/**/*.wav
+settings.json
+
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store
