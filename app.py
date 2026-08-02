@@ -16,8 +16,11 @@ r"""カラオケスタジオ — マイクを流しながら、オフボーカ�
 
 from __future__ import annotations
 
+import json
 import os
 import queue
+import subprocess
+import sys
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -96,6 +99,7 @@ class KaraokeApp(tk.Tk):
         self.current_track: music_search.Track | None = None
         self.current_local_path: str | None = None  # ローカル再生中のファイル
         self.separator_capability = None
+        self.editors: dict[int, dict] = {}  # 開いているプラグイン画面（別プロセス）
         self._photo: ImageTk.PhotoImage | None = None
         self._seeking = False
         self._busy = 0
@@ -438,10 +442,11 @@ class KaraokeApp(tk.Tk):
             ttk.Button(buttons, text=text, width=8 if len(text) > 2 else 3,
                        command=command).pack(side="left", padx=2)
 
-        ttk.Button(rack, text="プラグインの画面を開く", command=self.open_vst_editor,
-                   style="Big.TButton").grid(row=2, column=0, columnspan=3,
-                                             sticky="ew", pady=(8, 0))
-        ttk.Label(rack, text="※ 閉じるまでこの画面は操作できません（音は鳴り続けます）",
+        self.editor_button = ttk.Button(rack, text="プラグインの画面を開く",
+                                        command=self.open_vst_editor, style="Big.TButton")
+        self.editor_button.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        ttk.Label(rack, text="※ 画面は別ウィンドウで開きます。開いている間もこのアプリは"
+                             "そのまま使え、つまみを動かすと音にすぐ反映されます。",
                   style="Hint.TLabel", wraplength=260).grid(row=3, column=0, columnspan=3,
                                                             sticky="w", pady=(4, 0))
 
@@ -821,8 +826,10 @@ class KaraokeApp(tk.Tk):
         slots = self.chain.vst_slots
         self.vst_tree.delete(*self.vst_tree.get_children())
         for slot in slots:
-            self.vst_tree.insert("", "end",
-                                 values=(slot.name, "バイパス" if slot.bypass else "適用中"))
+            state = "バイパス" if slot.bypass else "適用中"
+            if id(slot) in self.editors:
+                state += " ◻"  # 画面を開いている
+            self.vst_tree.insert("", "end", values=(slot.name, state))
         items = self.vst_tree.get_children()
         target = None
         if select is not None and select in slots:
@@ -832,11 +839,17 @@ class KaraokeApp(tk.Tk):
         if target:
             self.vst_tree.selection_set(target)
             self.vst_tree.focus(target)
+        current = self.selected_slot()
+        self.editor_button.configure(
+            text="プラグインの画面を閉じる" if current is not None and id(current) in self.editors
+            else "プラグインの画面を開く")
         self._show_vst_parameters()
 
     def remove_vst(self) -> None:
         slot = self.selected_slot()
         if slot:
+            if id(slot) in self.editors:  # 画面を開いたまま外さない
+                self.close_vst_editor(slot)
             self.chain.remove_vst3(slot)
             self._refresh_vst_rack()
 
@@ -852,21 +865,101 @@ class KaraokeApp(tk.Tk):
             self.chain.move_vst3(slot, delta)
             self._refresh_vst_rack(select=slot)
 
+    # ---------- プラグインのエディタ（別プロセス） ----------
     def open_vst_editor(self) -> None:
+        """プラグイン本体の画面を開く。押すたびに開閉を切り替える。
+
+        pedalboard のエディタはメインスレッドからしか開けず、閉じるまで戻らない。
+        本体プロセスで開くとアプリ全体が固まるので、別プロセスに任せて
+        つまみの変化だけを受け取る。
+        """
         slot = self.selected_slot()
         if slot is None:
             return
-        # pedalboard の制約でエディタはメインスレッドからしか開けず、
-        # 閉じるまで戻ってこない。音声は別スレッドなので鳴り続ける。
-        self.status_label.configure(text=f"{slot.name} の画面を開いています（閉じると戻ります）")
-        self.update_idletasks()
+        if id(slot) in self.editors:
+            self.close_vst_editor(slot)
+            return
+
+        host = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vst_editor_host.py")
+        flags = subprocess.CREATE_NO_WINDOW if platform_support.WINDOWS else 0
         try:
-            slot.plugin.show_editor()
+            proc = subprocess.Popen(
+                [sys.executable, host, slot.path],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, encoding="utf-8", bufsize=1, creationflags=flags,
+            )
         except Exception as e:
-            messagebox.showerror(APP_TITLE, f"この プラグインは画面を開けません:\n{e}")
+            messagebox.showerror(APP_TITLE, f"エディタを起動できませんでした:\n{e}")
+            return
+
+        entry = {"proc": proc, "slot": slot, "ready": False}
+        self.editors[id(slot)] = entry
+        self._send_to_editor(slot, "init", slot.parameter_state())
+        threading.Thread(target=self._read_editor, args=(slot, proc), daemon=True).start()
+        self.status_label.configure(text=f"{slot.name} の画面を開いています…")
+        self._refresh_vst_rack(select=slot)
+
+    def close_vst_editor(self, slot=None) -> None:
+        """開いているエディタを閉じる。slot 省略で全部閉じる。"""
+        targets = [self.editors.get(id(slot))] if slot else list(self.editors.values())
+        for entry in [e for e in targets if e]:
+            self._send_to_editor(entry["slot"], "close")
+            proc = entry["proc"]
+            try:
+                proc.wait(timeout=3)
+            except Exception:
+                proc.kill()
+
+    def _send_to_editor(self, slot, command: str, params: dict | None = None) -> None:
+        entry = self.editors.get(id(slot))
+        if not entry:
+            return
+        message = {"cmd": command}
+        if params is not None:
+            message["params"] = params
+        try:
+            entry["proc"].stdin.write(json.dumps(message) + "\n")
+            entry["proc"].stdin.flush()
+        except Exception:
+            pass  # 既に閉じられている
+
+    def _read_editor(self, slot, proc) -> None:
+        """子プロセスからの通知を受け取る（ワーカースレッド）。"""
+        try:
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    message = json.loads(line)
+                except ValueError:
+                    continue
+                self.post(self._on_editor_event, slot, message)
         finally:
-            self.status_label.configure(text="準備完了")
-            self._show_vst_parameters()
+            proc.wait()
+            self.post(self._on_editor_closed, slot)
+
+    def _on_editor_event(self, slot, message: dict) -> None:
+        kind = message.get("type")
+        if kind == "ready":
+            entry = self.editors.get(id(slot))
+            if entry:
+                entry["ready"] = True
+            self.status_label.configure(text=f"{slot.name} の画面を表示中（本体はそのまま使えます）")
+            self._refresh_vst_rack(select=slot)
+        elif kind == "params":
+            # エディタで動かしたつまみを、実際に音が通っている方へ反映する
+            slot.apply_parameter_state(message.get("values", {}))
+            self._refresh_param_values()
+        elif kind == "error":
+            messagebox.showerror(APP_TITLE,
+                                 f"{slot.name} の画面を開けませんでした:\n{message.get('message')}")
+
+    def _on_editor_closed(self, slot) -> None:
+        self.editors.pop(id(slot), None)
+        self.status_label.configure(text="準備完了")
+        self._refresh_vst_rack(select=slot)
+        self._show_vst_parameters()
 
     # ---------- パラメータ操作 ----------
     def _on_param_scroll(self, event) -> None:
@@ -963,6 +1056,13 @@ class KaraokeApp(tk.Tk):
             except Exception:
                 pass
         entry["label"].configure(text=self._param_text(entry["param"]))
+        slot = entry["slot"]
+        if id(slot) in self.editors:  # 開いているエディタにも反映して食い違わせない
+            try:
+                self._send_to_editor(slot, "set",
+                                     {entry["key"]: float(entry["param"].raw_value)})
+            except Exception:
+                pass
 
     def _refresh_param_values(self) -> None:
         """プラグイン本体の画面で動かされた値を表示に反映する。"""
@@ -1275,6 +1375,7 @@ class KaraokeApp(tk.Tk):
         self.cfg["prefer_off_vocal"] = self.offvocal_var.get()
         self.cfg["vst3"] = self.chain.vst_state()
         config.save(self.cfg)
+        self.close_vst_editor()  # 開いたままのプラグイン画面を残さない
         self.player.stop()
         self.router.stop()
         self.destroy()
