@@ -1,0 +1,8 @@
+# シェルスクリプトは必ず LF。CRLF だと macOS / Linux で実行できない
+*.sh text eol=lf
+# バッチファイルは CRLF
+*.bat text eol=crlf
+
+*.py text
+*.md text
+*.txt text

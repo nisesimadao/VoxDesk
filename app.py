@@ -1,6 +1,8 @@
 r"""カラオケスタジオ — マイクを流しながら、オフボーカル音源を動画付きで再生する。
 
-    .\.venv\Scripts\pythonw.exe app.py
+起動:
+    Windows       カラオケスタジオを起動.bat（または .venv\Scripts\pythonw.exe app.py）
+    macOS / Linux ./start.sh（または .venv/bin/python app.py）
 
 構成:
     app.py          この画面
@@ -9,6 +11,7 @@ r"""カラオケスタジオ — マイクを流しながら、オフボーカ�
     player.py       動画再生（PyAV でデコードし、音は選んだデバイスへ）
     music_search.py YouTube から曲を探す
     devices.py      デバイスの一覧と診断
+    platform_support.py  OS ごとの違い（保存先・Host API・フォント・プラグイン探索先）
 """
 
 from __future__ import annotations
@@ -26,6 +29,7 @@ from PIL import ImageTk
 import config
 import devices as dev
 import music_search
+import platform_support
 from mic_chain import MicChain, available_vst3, karaoke_preset
 from player import AVPlayer
 from router import Router
@@ -111,10 +115,13 @@ class KaraokeApp(tk.Tk):
     # ================= 画面 =================
     def _build_ui(self) -> None:
         style = ttk.Style(self)
-        if "vista" in style.theme_names():
-            style.theme_use("vista")
-        style.configure("Big.TButton", font=("Meiryo UI", 11, "bold"), padding=8)
-        style.configure("Head.TLabel", font=("Meiryo UI", 10, "bold"))
+        platform_support.apply_theme(style)
+        # フォントは OS ごとに入っているものが違う。日本語が豆腐にならないよう
+        # 実際に入っている中から選ぶ。
+        family, _ = platform_support.ui_font(self)
+        self.ui_family = family
+        style.configure("Big.TButton", font=(family, 11, "bold"), padding=8)
+        style.configure("Head.TLabel", font=(family, 10, "bold"))
         style.configure("Hint.TLabel", foreground="#666")
 
         self.notebook = ttk.Notebook(self)
@@ -151,7 +158,7 @@ class KaraokeApp(tk.Tk):
         search.columnconfigure(1, weight=1)
         ttk.Label(search, text="曲を探す", style="Head.TLabel").grid(row=0, column=0, padx=(0, 8))
         self.query_var = tk.StringVar()
-        entry = ttk.Entry(search, textvariable=self.query_var, font=("Meiryo UI", 11))
+        entry = ttk.Entry(search, textvariable=self.query_var, font=(self.ui_family, 11))
         entry.grid(row=0, column=1, sticky="ew")
         entry.bind("<Return>", lambda _e: self.search())
         ttk.Button(search, text="検索", command=self.search).grid(row=0, column=2, padx=6)
@@ -191,7 +198,7 @@ class KaraokeApp(tk.Tk):
         scroll.grid(row=1, column=1, sticky="ns", pady=(8, 4))
 
         self.video_label = tk.Label(tab, bg="#101014", text="ここに映像が出ます（歌詞つき動画ならそのまま歌えます）",
-                                    fg="#666", font=("Meiryo UI", 10))
+                                    fg="#666", font=(self.ui_family, 10))
         self.video_label.grid(row=2, column=0, columnspan=2, sticky="nsew", pady=4)
         self.video_label.bind("<Configure>", self._on_video_resize)
         self.video_label.bind("<Double-1>", lambda _e: self.toggle_play())
@@ -334,11 +341,14 @@ class KaraokeApp(tk.Tk):
 
         ttk.Label(audio, text="Host API").grid(row=0, column=0, sticky="w", pady=3)
         apis = ["すべて"] + [a["name"] for a in sd.query_hostapis()]
-        self.api_var = tk.StringVar(value=self.cfg.get("hostapi", "Windows WASAPI"))
+        saved_api = self.cfg.get("hostapi")
+        if saved_api not in apis:  # 別の OS で保存された設定を引き継いだ場合など
+            saved_api = platform_support.default_host_api() or "すべて"
+        self.api_var = tk.StringVar(value=saved_api)
         api_combo = ttk.Combobox(audio, textvariable=self.api_var, values=apis, state="readonly")
         api_combo.grid(row=0, column=1, sticky="ew", padx=8, pady=3)
         api_combo.bind("<<ComboboxSelected>>", lambda _e: self._reload_devices())
-        ttk.Label(audio, text="WASAPI が低遅延。うまく動かない機器は MME を試す",
+        ttk.Label(audio, text=platform_support.host_api_hint(),
                   style="Hint.TLabel").grid(row=1, column=1, sticky="w", padx=8)
 
         ttk.Label(audio, text="遅延").grid(row=2, column=0, sticky="w", pady=3)
@@ -370,7 +380,7 @@ class KaraokeApp(tk.Tk):
         columns = ("kind", "device", "result", "hint")
         self.diag_tree = ttk.Treeview(tab, columns=columns, show="headings", height=8)
         for col, text, width in (("kind", "種類", 60), ("device", "デバイス", 330),
-                                 ("result", "結果", 260), ("hint", "Windows 側", 260)):
+                                 ("result", "結果", 260), ("hint", "OS 側の設定", 260)):
             self.diag_tree.heading(col, text=text)
             self.diag_tree.column(col, width=width, anchor="w")
         self.diag_tree.grid(row=2, column=0, sticky="nsew")
@@ -555,7 +565,7 @@ class KaraokeApp(tk.Tk):
         if device is None:
             return
         self.run_async(
-            lambda: (dev.check(device), dev.windows_hint(device)),
+            lambda: (dev.check(device), dev.system_hint(device)),
             lambda r: self._show_test_result(device, *r),
             busy_text=f"{device.name} を確認中…",
         )
@@ -563,14 +573,14 @@ class KaraokeApp(tk.Tk):
     def _show_test_result(self, device, health, hint) -> None:
         lines = [device.name, "", health.summary]
         if hint:
-            lines.append(f"Windows: {hint}")
+            lines.append(hint)
         if health.receives_audio is False:
             lines += [
                 "",
                 "音が来ていません。次を確認してください:",
                 "・機器側の入力切替（LINE / MIC）と録音レベル",
                 "・マイクのスイッチが ON か、ケーブルが奥まで挿さっているか",
-                "・Windows の「サウンド」でこのデバイスのレベルメーターが振れるか",
+                f"・{platform_support.sound_settings_hint()}",
             ]
         messagebox.showinfo(APP_TITLE, "\n".join(lines))
 
@@ -580,11 +590,11 @@ class KaraokeApp(tk.Tk):
         outputs = dev.list_devices("output", api)
 
         def work():
-            status = dev.windows_status()
+            status = dev.system_status()
             rows = []
             for device in inputs + outputs:
                 health = dev.check(device, seconds=0.8, timeout=5.0)
-                rows.append((device, health, dev.windows_hint(device, status)))
+                rows.append((device, health, dev.system_hint(device, status)))
             return rows
 
         self.diag_tree.delete(*self.diag_tree.get_children())

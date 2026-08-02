@@ -1,9 +1,12 @@
 r"""コマンドラインからマイクを流す（画面なしで使いたい人向け）。
 
-    .\.venv\Scripts\python.exe cli.py --list
-    .\.venv\Scripts\python.exe cli.py --mic Logicool --out JBL
-    .\.venv\Scripts\python.exe cli.py --mic "SE-U33GX" --out JBL --preset karaoke --gain 30
-    .\.venv\Scripts\python.exe cli.py --check           全デバイスを診断する
+Windows:        .\.venv\Scripts\python.exe cli.py --list
+macOS / Linux:  .venv/bin/python cli.py --list
+
+    cli.py --list                                     デバイス一覧
+    cli.py --check                                    全デバイスを診断する
+    cli.py --mic Logicool --out JBL                   流す
+    cli.py --mic "SE-U33GX" --out JBL --preset karaoke --gain 30
 
 デバイスは名前の一部で指定する（番号は挿し直すと変わるため）。
 """
@@ -15,6 +18,7 @@ import sys
 import time
 
 import devices as dev
+import platform_support
 from mic_chain import MicChain
 from router import Router
 
@@ -40,14 +44,14 @@ def print_devices(api: str | None) -> None:
 
 
 def check_devices(api: str | None) -> None:
-    status = dev.windows_status()
+    status = dev.system_status()
     for kind, title in (("input", "入力"), ("output", "出力")):
         print(f"=== {title} ===")
         for d in dev.list_devices(kind, api):
             health = dev.check(d, seconds=0.8, timeout=5.0)
-            hint = dev.windows_hint(d, status)
+            hint = dev.system_hint(d, status)
             print(f"  {health.summary:<40} {d.name} [{d.hostapi}]"
-                  + (f"  / Windows: {hint}" if hint else ""))
+                  + (f"  / {hint}" if hint else ""))
 
 
 def apply_preset(chain: MicChain, name: str) -> None:
@@ -72,8 +76,9 @@ def main() -> None:
     p = argparse.ArgumentParser(description="マイクを指定の出力先へ流す")
     p.add_argument("--list", action="store_true", help="デバイス一覧")
     p.add_argument("--check", action="store_true", help="全デバイスを診断")
-    p.add_argument("--api", default="Windows WASAPI",
-                   help="Host API（'all' で全部。既定: Windows WASAPI）")
+    default_api = platform_support.default_host_api()
+    p.add_argument("--api", default=default_api or "all",
+                   help=f"Host API（'all' で全部。既定: {default_api or 'all'}）")
     p.add_argument("--mic", help="入力デバイス名の一部")
     p.add_argument("--out", help="出力デバイス名の一部")
     p.add_argument("--preset", choices=list(PRESETS), default="usb")

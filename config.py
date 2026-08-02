@@ -10,11 +10,14 @@ import json
 import os
 from typing import Any
 
-APP_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "KaraokeStudio")
+import platform_support
+
+APP_DIR = platform_support.app_data_dir()
 CONFIG_PATH = os.path.join(APP_DIR, "settings.json")
 
 DEFAULTS: dict[str, Any] = {
-    "hostapi": "Windows WASAPI",
+    # 既定の Host API は OS によって違う（Windows は WASAPI、macOS は Core Audio）
+    "hostapi": platform_support.default_host_api() or "すべて",
     "mic_device_name": "",
     "output_device_name": "",
     "latency": "low",

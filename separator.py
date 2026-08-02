@@ -22,15 +22,17 @@ from dataclasses import dataclass
 import av
 import numpy as np
 
+import platform_support
+
 MIN_VRAM_GB = 4.0     # これ未満の GPU では分離させない
 MIN_RAM_GB = 8.0
 HQ_VRAM_GB = 8.0      # これ以上なら高品質モデルを使う
+MPS_MIN_RAM_GB = 16.0  # Apple Silicon は GPU とメモリを共有するので基準を上げる
+MPS_HQ_RAM_GB = 32.0
 FAST_MODEL = "htdemucs"
 HQ_MODEL = "htdemucs_ft"
 
-CACHE_DIR = os.path.join(
-    os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "KaraokeStudio", "offvocal"
-)
+CACHE_DIR = os.path.join(platform_support.cache_dir(), "offvocal")
 
 
 @dataclass
@@ -58,7 +60,7 @@ _model_cache: dict = {}
 
 
 def _total_ram_gb() -> float:
-    if sys.platform == "win32":
+    if platform_support.WINDOWS:
         class MemoryStatus(ctypes.Structure):
             _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
                         ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
@@ -97,41 +99,56 @@ def _detect() -> Capability:
     except ImportError:
         return Capability(False, "ボーカル除去に必要な部品（demucs）が入っていません")
 
-    if not torch.cuda.is_available():
-        return Capability(
-            False, "対応する GPU が見つかりません（NVIDIA の CUDA 対応 GPU が必要です）")
-
-    props = torch.cuda.get_device_properties(0)
-    vram = props.total_memory / (1024 ** 3)
-    if vram < MIN_VRAM_GB:
-        return Capability(
-            False,
-            f"GPU のメモリが足りません（{vram:.1f} GB / {MIN_VRAM_GB:.0f} GB 以上必要）",
-            gpu_name=props.name, vram_gb=vram)
-
     ram = _total_ram_gb()
-    if ram and ram < MIN_RAM_GB:
+
+    if torch.cuda.is_available():  # NVIDIA GPU
+        props = torch.cuda.get_device_properties(0)
+        vram = props.total_memory / (1024 ** 3)
+        if vram < MIN_VRAM_GB:
+            return Capability(
+                False,
+                f"GPU のメモリが足りません（{vram:.1f} GB / {MIN_VRAM_GB:.0f} GB 以上必要）",
+                gpu_name=props.name, vram_gb=vram)
+        if ram and ram < MIN_RAM_GB:
+            return Capability(
+                False, f"メモリが足りません（{ram:.1f} GB / {MIN_RAM_GB:.0f} GB 以上必要）",
+                gpu_name=props.name, vram_gb=vram)
         return Capability(
-            False, f"メモリが足りません（{ram:.1f} GB / {MIN_RAM_GB:.0f} GB 以上必要）",
-            gpu_name=props.name, vram_gb=vram)
+            True, device="cuda", gpu_name=props.name, vram_gb=vram,
+            model=HQ_MODEL if vram >= HQ_VRAM_GB else FAST_MODEL,
+        )
+
+    # Apple Silicon。GPU とメモリを共有するので、判定はメモリ量で行う
+    mps = getattr(torch.backends, "mps", None)
+    if platform_support.MACOS and mps is not None and mps.is_available():
+        if ram and ram < MPS_MIN_RAM_GB:
+            return Capability(
+                False,
+                f"メモリが足りません（{ram:.1f} GB / {MPS_MIN_RAM_GB:.0f} GB 以上必要）",
+                gpu_name="Apple Silicon GPU", vram_gb=ram)
+        return Capability(
+            True, device="mps", gpu_name="Apple Silicon GPU", vram_gb=ram,
+            model=HQ_MODEL if ram >= MPS_HQ_RAM_GB else FAST_MODEL,
+        )
 
     return Capability(
-        True, device="cuda", gpu_name=props.name, vram_gb=vram,
-        model=HQ_MODEL if vram >= HQ_VRAM_GB else FAST_MODEL,
-    )
+        False,
+        "対応する GPU が見つかりません"
+        "（NVIDIA の CUDA 対応 GPU か、Apple Silicon の Mac が必要です）")
 
 
-def _load_model(name: str):
-    if name in _model_cache:
-        return _model_cache[name]
+def _load_model(name: str, device: str):
+    key = (name, device)
+    if key in _model_cache:
+        return _model_cache[key]
     import torch
     from demucs.pretrained import get_model
 
     model = get_model(name)
-    model.to("cuda")
+    model.to(device)
     model.eval()
     torch.set_grad_enabled(False)
-    _model_cache[name] = model
+    _model_cache[key] = model
     return model
 
 

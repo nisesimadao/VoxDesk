@@ -20,6 +20,7 @@ import numpy as np
 import sounddevice as sd
 from scipy import signal
 
+import platform_support
 from comutil import com_initialized
 
 
@@ -225,7 +226,7 @@ class Router:
         if worker.is_alive() and generation == self._generation and self.state == "opening":
             self._set_state(
                 "error",
-                "デバイスが応答しません。別の Host API（WASAPI など）を試してください。",
+                f"デバイスが応答しません。{platform_support.alternate_api_hint()}。",
             )
 
     def _open_worker(self, generation, in_device, out_device, latency, blocksize,
@@ -296,7 +297,7 @@ class Router:
         if "Device unavailable" in text or "-9985" in text:
             return "デバイスが他のアプリに使われています"
         if "Invalid device" in text:
-            return "このデバイスは選べません（別の Host API を試してください）"
+            return f"このデバイスは選べません（{platform_support.alternate_api_hint()}）"
         return f"{type(e).__name__}: {text}"
 
     def stop(self) -> None:

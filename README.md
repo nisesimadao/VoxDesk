@@ -7,7 +7,15 @@
 
 ## 使い方
 
-`カラオケスタジオを起動.bat` をダブルクリックするだけです（初回のみ数分の準備が走ります）。
+| OS | 起動方法 |
+|---|---|
+| Windows | `カラオケスタジオを起動.bat` をダブルクリック |
+| macOS / Linux | `chmod +x start.sh && ./start.sh` |
+
+初回のみ数分の準備（仮想環境の作成と依存のインストール）が走ります。
+
+macOS では `brew install python-tk`、Linux では `sudo apt install python3-tk libportaudio2`
+（Fedora なら `python3-tkinter portaudio`）が別途必要です。起動スクリプトが不足を検出して案内します。
 
 1. **カラオケ** タブで曲名を入れて検索 → 「オフボーカル度」が高いものを選んで再生
 2. **マイク** タブで、マイクと出力先を選んで「マイクを入れる」
@@ -37,11 +45,11 @@ Apple Music や Spotify は音声が保護されているため取り込めま�
 
 この機能は動作環境を満たす PC でだけ有効になります（満たさない場合はボタンが押せず、理由が横に出ます）。
 
-| 条件 | 必要な水準 |
+| 環境 | 必要な水準 |
 |---|---|
-| GPU | NVIDIA の CUDA 対応 GPU、VRAM 4 GB 以上 |
-| メモリ | 8 GB 以上 |
-| モデル | VRAM 8 GB 以上なら高品質モデル、それ未満は標準モデル |
+| NVIDIA GPU（Windows / Linux） | VRAM 4 GB 以上、メモリ 8 GB 以上。VRAM 8 GB 以上で高品質モデル |
+| Apple Silicon（macOS） | メモリ 16 GB 以上。32 GB 以上で高品質モデル |
+| それ以外 | 使えません（CPU だけで動かすと 1 曲に数十分かかるため、あえて無効にしています） |
 
 導入（合計 3 GB ほどダウンロードします）:
 
@@ -105,6 +113,23 @@ Apple Music や Spotify は音声が保護されているため取り込めま�
 | `player.py` | 動画再生。PyAV でデコードし、音声クロックに映像を合わせる。音は選んだデバイスへ出す |
 | `music_search.py` | yt-dlp で検索し、タイトルからオフボーカルらしさを採点する |
 | `devices.py` | デバイスの一覧と診断。実際に開いてデータが来るかまで確認する |
-| `router.py` / `player.py` の COM 初期化 | WASAPI はスレッドごとに COM 初期化が必要。忘れると原因の分かりにくいエラーになる |
+| `platform_support.py` | OS ごとの違い（設定の保存先、Host API の既定、プラグイン探索先、フォントとテーマ）を集約 |
+| `comutil.py` | WASAPI はスレッドごとに COM 初期化が必要。忘れると原因の分かりにくいエラーになる。他 OS では何もしない |
+
+## 対応 OS
+
+Windows / macOS / Linux で動く作りにしています。OS ごとの違いは次のとおりです。
+
+| | Windows | macOS | Linux |
+|---|---|---|---|
+| Host API の既定 | WASAPI | Core Audio | ALSA |
+| 設定の保存先 | `%APPDATA%` | `~/Library/Application Support` | `~/.config` |
+| 作成した音源 | `%LOCALAPPDATA%` | `~/Library/Caches` | `~/.cache` |
+| プラグイン | VST3 | VST3 + Audio Unit | VST3 |
+| OS 側のミュート検出 | 対応 | 非対応（診断の他項目は動作） | 非対応（同左） |
+| ボーカル除去 | CUDA | Apple Silicon (MPS) | CUDA |
+
+開発は Windows 11 + RTX 3090 で行い、macOS と Linux では OS 分岐のロジックのみ検証しています
+（実機での動作確認は未実施）。
 
 再生する動画の扱いは、各サービスの利用規約と著作権法に従ってください。

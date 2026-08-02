@@ -14,9 +14,8 @@ from dataclasses import dataclass
 import numpy as np
 import sounddevice as sd
 
+import platform_support
 from comutil import com_initialized
-
-PREFERRED_APIS = ("Windows WASAPI", "MME", "Windows DirectSound", "Windows WDM-KS")
 
 
 @dataclass
@@ -206,8 +205,14 @@ def describe_error(e: Exception) -> str:
     return f"{type(e).__name__}"
 
 
-def windows_status() -> dict[str, dict]:
-    """Windows 側の有効/ミュート/レベルを名前ごとに返す。取得できなければ空。"""
+def system_status() -> dict[str, dict]:
+    """OS 側の有効/ミュート/レベルを名前ごとに返す。取得できなければ空。
+
+    今のところ Windows でのみ取得できる（pycaw 経由）。他の OS では空を返し、
+    「OS 側の設定」の欄が出ないだけで、他の診断はそのまま動く。
+    """
+    if not platform_support.WINDOWS:
+        return {}
     try:
         from comtypes import CLSCTX_ALL
         from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
@@ -236,21 +241,22 @@ def windows_status() -> dict[str, dict]:
     return status
 
 
-def windows_hint(device: Device, status: dict[str, dict] | None = None) -> str:
-    """Windows 側の設定で問題がありそうなら、その説明を返す。"""
-    status = status if status is not None else windows_status()
+def system_hint(device: Device, status: dict[str, dict] | None = None) -> str:
+    """OS 側の設定で問題がありそうなら、その説明を返す。"""
+    status = status if status is not None else system_status()
     if not status:
         return ""
-    # PortAudio 名は "マイク (機器名)" のように Windows 名と一致することが多いが、
+    label = "Windows" if platform_support.WINDOWS else "OS"
+    # PortAudio 名は "マイク (機器名)" のように OS 側の名前と一致することが多いが、
     # 31 文字で切られる API もあるため前方一致で照合する
     for name, entry in status.items():
         if name == device.name or name.startswith(device.name[:28]) or \
                 device.name.startswith(name[:28]):
             if not entry["active"]:
-                return "Windows でこのデバイスは「未接続」です"
+                return f"{label} でこのデバイスは「未接続」です"
             if entry["muted"]:
-                return "Windows でミュートされています"
+                return f"{label} でミュートされています"
             if entry["level"] is not None and entry["level"] < 0.2:
-                return f"Windows の入力レベルが {entry['level']*100:.0f}% と低いです"
+                return f"{label} の入力レベルが {entry['level']*100:.0f}% と低いです"
             return ""
     return ""

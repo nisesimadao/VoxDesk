@@ -18,6 +18,8 @@ import threading
 from dataclasses import dataclass, field
 
 import numpy as np
+
+import platform_support
 from pedalboard import (
     Compressor,
     Gain,
@@ -30,21 +32,16 @@ from pedalboard import (
     load_plugin,
 )
 
-VST3_DIRS = [
-    r"C:\Program Files\Common Files\VST3",
-    r"C:\Program Files (x86)\Common Files\VST3",
-    os.path.expandvars(r"%LOCALAPPDATA%\Programs\Common\VST3"),
-]
-
-
 def available_vst3() -> list[tuple[str, str]]:
     """(表示名, パス) の一覧を返す。
 
-    VST3 はベンダー名のサブフォルダに置かれることがあるため 2 階層まで探す。
-    .vst3 自体がフォルダ形式（バンドル）の場合があるので、見つけたらそこで止める。
+    プラグインはベンダー名のサブフォルダに置かれることがあるため 2 階層まで探す。
+    .vst3 や .component 自体がフォルダ形式（バンドル）の場合があるので、
+    見つけたらその中までは降りない。探索先と拡張子は OS ごとに違う。
     """
+    extensions = platform_support.plugin_extensions()
     found: dict[str, str] = {}
-    for directory in VST3_DIRS:
+    for directory in platform_support.plugin_dirs():
         if not os.path.isdir(directory):
             continue
         for root, dirs, files in os.walk(directory):
@@ -53,10 +50,12 @@ def available_vst3() -> list[tuple[str, str]]:
                 dirs.clear()
                 continue
             for entry in list(dirs) + files:
-                if entry.lower().endswith(".vst3"):
-                    found.setdefault(entry[:-5], os.path.join(root, entry))
+                lowered = entry.lower()
+                match = next((e for e in extensions if lowered.endswith(e)), None)
+                if match:
+                    found.setdefault(entry[: -len(match)], os.path.join(root, entry))
                     if entry in dirs:
-                        dirs.remove(entry)  # バンドル内部までは降りない
+                        dirs.remove(entry)
     return sorted(found.items())
 
 
@@ -298,8 +297,15 @@ class MicChain:
     def restore_vst_state(self, saved: list[dict]) -> list[str]:
         """保存した構成を復元する。読み込めなかったものの名前を返す。"""
         failed = []
+        catalog = None
         for entry in saved or []:
             path = entry.get("path", "")
+            if path and not os.path.exists(path):
+                # 別の OS や別のインストール先で保存された設定でも、
+                # 同じ名前のプラグインが入っていれば拾い直す
+                if catalog is None:
+                    catalog = dict(available_vst3())
+                path = catalog.get(entry.get("name", ""), "")
             if not path or not os.path.exists(path):
                 failed.append(entry.get("name", path))
                 continue
