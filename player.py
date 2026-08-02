@@ -32,10 +32,14 @@ _NET_OPTIONS = {
 
 
 def _fit(src_w: int, src_h: int, box_w: int, box_h: int) -> tuple[int, int]:
-    """アスペクト比を保ったまま box に収まるサイズを返す。"""
+    """アスペクト比を保ったまま box に収まるサイズを返す。
+
+    元より大きくはしない。引き伸ばしても画質は上がらないのに、
+    変換と描画の手間だけが増える（640x360 を 960x540 にすると倍近く重くなる）。
+    """
     if src_w <= 0 or src_h <= 0 or box_w <= 1 or box_h <= 1:
         return max(2, box_w), max(2, box_h)
-    scale = min(box_w / src_w, box_h / src_h)
+    scale = min(box_w / src_w, box_h / src_h, 1.0)
     return max(2, int(src_w * scale)), max(2, int(src_h * scale))
 
 
@@ -73,6 +77,8 @@ class AVPlayer:
         self._n_decoders = 0
         self._has_audio = False
         self._wall_base: float | None = None  # 音声が無い動画用のクロック基準
+        self.video_size = (0, 0)  # 元の映像の大きさ（これより拡大しない）
+        self.dropped = 0          # 間に合わず捨てたフレーム数
 
     # ---------- 情報 ----------
     @property
@@ -93,7 +99,11 @@ class AVPlayer:
         )
 
     def set_display_size(self, width: int, height: int) -> None:
-        self._display_size = (max(2, width), max(2, height))
+        """表示に使う大きさ。細かく変えると画像を作り直す羽目になるので粗く丸める。"""
+        width, height = max(2, width), max(2, height)
+        quantized = (width - width % 16, height - height % 16)
+        if quantized != self._display_size:
+            self._display_size = quantized
 
     # ---------- 開始 / 停止 ----------
     def open(self, video_url: str, audio_url: str | None = None,
@@ -383,6 +393,12 @@ class AVPlayer:
         pts = float(frame.pts * frame.time_base) if frame.pts is not None else self._clock
         if pts < self._skip_until - 0.02:
             return  # 変換前に捨てる（reformat は重い）
+        # 既に再生位置を過ぎたフレームは、変換せずに捨てる。
+        # 表示されないものに 5〜15ms かけるのは無駄で、それが積もると重くなる
+        if self._has_audio and pts < self._clock - 0.12:
+            self.dropped += 1
+            return
+        self.video_size = (frame.width, frame.height)
         box_w, box_h = self._display_size
         w, h = _fit(frame.width, frame.height, box_w, box_h)
         image = frame.reformat(width=w, height=h, format="rgb24").to_image()

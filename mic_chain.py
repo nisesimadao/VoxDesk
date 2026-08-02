@@ -13,6 +13,7 @@ pedalboard（JUCE ベース、C++ 実装なのでリアルタイムでも軽い�
 
 from __future__ import annotations
 
+import itertools
 import os
 import re
 import threading
@@ -84,6 +85,9 @@ def names_from_error(message: str) -> list[str]:
     return re.findall(r'"([^"]+)"', message)
 
 
+_slot_counter = itertools.count(1)
+
+
 @dataclass
 class VstSlot:
     """チェーンに挿した VST3 ひとつぶん。"""
@@ -93,6 +97,9 @@ class VstSlot:
     plugin: object
     bypass: bool = False
     plugin_name: str | None = None  # 1 ファイルに複数入っている場合の指定
+    # 通し番号。id() を鍵に使うと、外したあと同じ番地が再利用されたときに
+    # 別のプラグインと取り違える
+    key: int = field(default_factory=lambda: next(_slot_counter))
 
     def parameter_state(self) -> dict:
         """パラメータを 0〜1 の正規化値で書き出す。

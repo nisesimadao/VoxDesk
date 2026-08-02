@@ -29,11 +29,25 @@ CACHE_SECONDS = 3600
 
 # タイトルから取り除く飾り。これが入った括弧ごと落とす。
 DECORATIONS = (
-    "カラオケ", "karaoke", "オフボーカル", "off vocal", "offvocal", "off-vocal",
-    "instrumental", "インスト", "伴奏", "ガイドメロディ", "ガイドメロ", "ガイドなし",
-    "歌詞付", "歌詞あり", "字幕", "音程バー", "原曲キー", "キー変更", "女性キー", "男性キー",
-    "cover", "カバー", "mv", "pv", "full", "フル", "高音質", "練習用", "生音", "音源",
+    # カラオケ音源そのものを指す語
+    "ニコカラ", "ニコカラver", "nicokara", "カラオケ", "karaoke", "オフボーカル",
+    "off vocal", "offvocal", "off-vocal", "instrumental", "インスト", "伴奏",
+    "ガイドメロディ", "ガイドメロ", "ガイドなし", "ガイド無し", "メロディなし",
+    # ボーカル入りの版も同じ飾り
+    "オンボーカル", "on vocal", "onvocal", "on-vocal",
+    # 表示に関する語（「歌詞付き」の「き」が残らないよう長い方から並べる）
+    "歌詞付き", "歌詞付", "歌詞あり", "歌詞入り", "歌詞表示", "字幕", "音程バー",
+    "ルビ", "ふりがな",
+    # キーに関する語
+    "原曲キー", "キー変更", "女性キー", "男性キー", "原曲", "移調", "キー",
+    # 種類・素材に関する語
+    "cover", "カバー", "mv", "pv", "full", "フル", "tvサイズ", "tv size", "short",
+    "高音質", "練習用", "生音", "音源", "本家", "本家様", "音源本家様", "utaite",
+    "歌ってみた用", "修正版", "リメイク", "公式", "official", "hd", "4k", "1080p",
+    "ボカロ", "vocaloid", "アニメ", "主題歌", "op", "ed", "フリー", "無料",
 )
+# 「+5」「-3」「±0」「(-2)」のようなキー表記
+KEY_MARK = r"[（(\[]?\s*[±+＋\-−]\s?\d{1,2}\s*(?:key|キー|半音)?\s*[）)\]]?"
 BRACKETS = r"[【\[（(「『][^】\]）)」』]*[】\]）)」』]"
 
 _cache: dict[str, tuple[float, object]] = {}
@@ -81,9 +95,15 @@ def clean_title(raw: str) -> tuple[str, str]:
         return "" if any(word in inner for word in DECORATIONS) else match.group(0)
 
     text = re.sub(BRACKETS, drop, text)
-    # 残った飾り語も削る
-    for word in DECORATIONS:
-        text = re.sub(re.escape(word), " ", text, flags=re.I)
+    # 残った飾り語も削る（長いものから消さないと部分一致で崩れる）
+    for word in sorted(DECORATIONS, key=len, reverse=True):
+        if word.isascii():
+            # 英字は語の区切りを見る。そうしないと Official髭男dism のような
+            # アーティスト名まで削ってしまう
+            text = re.sub(rf"\b{re.escape(word)}\b", " ", text, flags=re.I)
+        else:
+            text = re.sub(re.escape(word), " ", text, flags=re.I)
+    text = re.sub(KEY_MARK, " ", text)
     # 中身が消えて空になった括弧と、その残骸を落とす
     #（【女性キー(+5)】 のような入れ子だと閉じ括弧だけ残ることがある）
     text = re.sub(r"[【\[（(「『]\s*[】\]）)」』]", " ", text)

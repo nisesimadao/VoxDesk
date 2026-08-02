@@ -180,9 +180,12 @@ class KaraokeApp(tk.Tk):
         self.separator_capability = None
         self.editors: dict[int, dict] = {}  # 開いているプラグイン画面（別プロセス）
         self._photo: ImageTk.PhotoImage | None = None
+        self._previous_photo = None  # 差し替え直後の 1 回ぶんだけ残す
         self._seeking = False
         self._transport_state = ""  # 表示を実際の再生状態に追従させるために覚えておく
         self._last_xruns = 0
+        self._resize_job = None
+        self._pending_size = (0, 0)
         self._busy = 0
 
         self._set_icon()
@@ -255,7 +258,9 @@ class KaraokeApp(tk.Tk):
     def _build_karaoke_tab(self) -> None:
         tab = self.karaoke_tab
         tab.columnconfigure(0, weight=1)
-        tab.rowconfigure(3, weight=1)  # 映像の行だけ伸びる
+        # 映像の行だけ伸びる。最低限の高さを確保しないと、
+        # 他の行に押されて映像がほとんど映らなくなる
+        tab.rowconfigure(3, weight=1, minsize=260)
 
         search = ttk.Frame(tab)
         search.grid(row=0, column=0, sticky="ew")
@@ -316,11 +321,21 @@ class KaraokeApp(tk.Tk):
         self.result_tree.configure(yscrollcommand=scroll.set)
         scroll.grid(row=2, column=1, sticky="ns", pady=(8, 4))
 
-        self.video_label = tk.Label(tab, bg="#101014", text="ここに映像が出ます（歌詞つき動画ならそのまま歌えます）",
-                                    fg="#666", font=(self.ui_family, 10))
-        self.video_label.grid(row=3, column=0, columnspan=2, sticky="nsew", pady=4)
-        self.video_label.bind("<Configure>", self._on_video_resize)
+        # 映像は固定枠の中に置いて中央寄せする。
+        # ラベルを直接並べると、画像を入れるたびにラベルの大きさが変わり、
+        # それがまた表示サイズの変更を呼んで作り直しが延々と続く。
+        video_frame = tk.Frame(tab, bg="#101014", height=260)
+        video_frame.grid(row=3, column=0, columnspan=2, sticky="nsew", pady=4)
+        video_frame.grid_propagate(False)
+        video_frame.pack_propagate(False)
+        self.video_frame = video_frame
+        self.video_label = tk.Label(
+            video_frame, bg="#101014", fg="#666", font=(self.ui_family, 10),
+            text="ここに映像が出ます（歌詞つき動画ならそのまま歌えます）")
+        self.video_label.place(relx=0.5, rely=0.5, anchor="center")
+        video_frame.bind("<Configure>", self._on_video_resize)
         self.video_label.bind("<Double-1>", lambda _e: self.toggle_play())
+        video_frame.bind("<Double-1>", lambda _e: self.toggle_play())
 
         lyric_box = tk.Frame(tab, bg="#101014")
         lyric_box.grid(row=4, column=0, columnspan=2, sticky="ew")
@@ -1258,7 +1273,7 @@ class KaraokeApp(tk.Tk):
         self.vst_tree.delete(*self.vst_tree.get_children())
         for slot in slots:
             state = "バイパス" if slot.bypass else "適用中"
-            if id(slot) in self.editors:
+            if slot.key in self.editors:
                 state += " ◻"  # 画面を開いている
             self.vst_tree.insert("", "end", values=(slot.name, state))
         items = self.vst_tree.get_children()
@@ -1272,14 +1287,14 @@ class KaraokeApp(tk.Tk):
             self.vst_tree.focus(target)
         current = self.selected_slot()
         self.editor_button.configure(
-            text="プラグインの画面を閉じる" if current is not None and id(current) in self.editors
+            text="プラグインの画面を閉じる" if current is not None and current.key in self.editors
             else "プラグインの画面を開く")
         self._show_vst_parameters()
 
     def remove_vst(self) -> None:
         slot = self.selected_slot()
         if slot:
-            if id(slot) in self.editors:  # 画面を開いたまま外さない
+            if slot.key in self.editors:  # 画面を開いたまま外さない
                 self.close_vst_editor(slot)
             self.chain.remove_vst3(slot)
             self._refresh_vst_rack()
@@ -1307,7 +1322,7 @@ class KaraokeApp(tk.Tk):
         slot = self.selected_slot()
         if slot is None:
             return
-        if id(slot) in self.editors:
+        if slot.key in self.editors:
             self.close_vst_editor(slot)
             return
 
@@ -1332,7 +1347,7 @@ class KaraokeApp(tk.Tk):
             return
 
         entry = {"proc": proc, "slot": slot, "ready": False}
-        self.editors[id(slot)] = entry
+        self.editors[slot.key] = entry
         self._send_to_editor(slot, "init", slot.parameter_state())
         threading.Thread(target=self._read_editor, args=(slot, proc), daemon=True).start()
         self.status_label.configure(text=f"{slot.name} の画面を開いています…")
@@ -1340,7 +1355,7 @@ class KaraokeApp(tk.Tk):
 
     def close_vst_editor(self, slot=None) -> None:
         """開いているエディタを閉じる。slot 省略で全部閉じる。"""
-        targets = [self.editors.get(id(slot))] if slot else list(self.editors.values())
+        targets = [self.editors.get(slot.key)] if slot else list(self.editors.values())
         for entry in [e for e in targets if e]:
             self._send_to_editor(entry["slot"], "close")
             proc = entry["proc"]
@@ -1350,7 +1365,7 @@ class KaraokeApp(tk.Tk):
                 proc.kill()
 
     def _send_to_editor(self, slot, command: str, params: dict | None = None) -> None:
-        entry = self.editors.get(id(slot))
+        entry = self.editors.get(slot.key)
         if not entry:
             return
         message = {"cmd": command}
@@ -1381,7 +1396,7 @@ class KaraokeApp(tk.Tk):
     def _on_editor_event(self, slot, message: dict) -> None:
         kind = message.get("type")
         if kind == "ready":
-            entry = self.editors.get(id(slot))
+            entry = self.editors.get(slot.key)
             if entry:
                 entry["ready"] = True
             self.status_label.configure(text=f"{slot.name} の画面を表示中（本体はそのまま使えます）")
@@ -1397,7 +1412,7 @@ class KaraokeApp(tk.Tk):
                                  f"{slot.name} の画面を開けませんでした:\n{message.get('message')}")
 
     def _on_editor_closed(self, slot) -> None:
-        self.editors.pop(id(slot), None)
+        self.editors.pop(slot.key, None)
         self.status_label.configure(text="準備完了")
         self._refresh_vst_rack(select=slot)
         self._show_vst_parameters()
@@ -1498,7 +1513,7 @@ class KaraokeApp(tk.Tk):
                 pass
         entry["label"].configure(text=self._param_text(entry["param"]))
         slot = entry["slot"]
-        if id(slot) in self.editors:  # 開いているエディタにも反映して食い違わせない
+        if slot.key in self.editors:  # 開いているエディタにも反映して食い違わせない
             try:
                 self._send_to_editor(slot, "set",
                                      {entry["key"]: float(entry["param"].raw_value)})
@@ -2015,8 +2030,8 @@ class KaraokeApp(tk.Tk):
         out = self.selected_device("output")
         self.player.stop()
         self._photo = None
-        self.player.set_display_size(max(2, self.video_label.winfo_width()),
-                                     max(2, self.video_label.winfo_height()))
+        self.player.set_display_size(max(2, self.video_frame.winfo_width()),
+                                     max(2, self.video_frame.winfo_height()))
         self.player.open(path, None, {}, device=out.index if out else None)
         name = os.path.basename(path)
         self.music_status.configure(text=f"再生中: {name}")
@@ -2079,8 +2094,8 @@ class KaraokeApp(tk.Tk):
             # キーを変える場合は、手元に取り込んでから変換して鳴らす
             self.apply_key_to_current()
             return
-        self.player.set_display_size(max(2, self.video_label.winfo_width()),
-                                    max(2, self.video_label.winfo_height()))
+        self.player.set_display_size(max(2, self.video_frame.winfo_width()),
+                                    max(2, self.video_frame.winfo_height()))
         self.player.open(src.video_url, src.audio_url, src.headers,
                          device=out.index if out else None, duration=src.duration)
         self.music_status.configure(text=f"再生中: {src.title}")
@@ -2206,7 +2221,20 @@ class KaraokeApp(tk.Tk):
         messagebox.showerror(APP_TITLE, f"再生できませんでした。\n\n{message}")
 
     def _on_video_resize(self, event) -> None:
-        self.player.set_display_size(event.width, event.height)
+        """枠の大きさが変わったら表示サイズを合わせる。
+
+        ドラッグ中は何十回も呼ばれるので、落ち着いてから 1 回だけ反映する。
+        """
+        self._pending_size = (event.width, event.height)
+        if self._resize_job is not None:
+            self.after_cancel(self._resize_job)
+        self._resize_job = self.after(200, self._apply_video_size)
+
+    def _apply_video_size(self) -> None:
+        self._resize_job = None
+        width, height = self._pending_size
+        if width > 1 and height > 1:
+            self.player.set_display_size(width, height)
 
     @staticmethod
     def _typing(event) -> bool:
@@ -2254,15 +2282,20 @@ class KaraokeApp(tk.Tk):
             self.in_meter["value"] = self.out_meter["value"] = 0
             self.quality_label.configure(text="")
 
-        # 映像
+        # 映像。大きさが同じなら貼り替えるだけで済ませる
+        #（作り直しは何倍も重く、GUI 全体が固まる原因になる）
         image = self.player.take_frame()
         if image is not None:
             if self._photo is None or self._photo.width() != image.width or \
                     self._photo.height() != image.height:
+                # 表示中の画像をその場で捨てると、描画途中の Tk が
+                # 無くなったものを触りに行くことがある。1 回ぶん残しておく。
+                self._previous_photo = self._photo
                 self._photo = ImageTk.PhotoImage(image)
+                self.video_label.configure(image=self._photo, text="")
             else:
-                self._photo.paste(image)  # 同じサイズなら貼り替えるだけで速い
-            self.video_label.configure(image=self._photo, text="")
+                self._photo.paste(image)
+                self._previous_photo = None
 
         # VST3 タブを見ている間は、本体の画面で変えた値を表示に反映する
         self._tick_count = getattr(self, "_tick_count", 0) + 1

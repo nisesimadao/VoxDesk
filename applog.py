@@ -7,15 +7,18 @@
 
 from __future__ import annotations
 
+import faulthandler
 import logging
 import os
 
 import platform_support
 
 LOG_PATH = os.path.join(platform_support.app_data_dir(), "voxdesk.log")
+CRASH_PATH = os.path.join(platform_support.app_data_dir(), "crash.log")
 MAX_BYTES = 1_000_000
 
 _ready = False
+_crash_file = None
 
 
 def setup() -> str:
@@ -36,6 +39,17 @@ def setup() -> str:
         )
     except Exception:
         logging.basicConfig(level=logging.INFO)  # 書けなくても動作は続ける
+
+    # 音声や動画の土台は C で書かれているため、そこで落ちると Python の
+    # 記録には何も残らない。落ちた瞬間の全スレッドの居場所を別ファイルに残す。
+    global _crash_file
+    try:
+        _crash_file = open(CRASH_PATH, "a", encoding="utf-8", buffering=1)
+        _crash_file.write(f"\n===== 起動 {os.getpid()} =====\n")
+        faulthandler.enable(file=_crash_file, all_threads=True)
+    except Exception:
+        pass
+
     _ready = True
     return LOG_PATH
 

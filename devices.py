@@ -14,8 +14,11 @@ from dataclasses import dataclass
 import numpy as np
 import sounddevice as sd
 
+import applog
 import platform_support
 from comutil import com_initialized
+
+LOG = applog.get(__name__)
 
 
 @dataclass
@@ -34,8 +37,21 @@ class Device:
         return f"{self.name}  [{self.hostapi}]{mark}"
 
 
+_probes_running = 0
+_probe_lock = threading.Lock()
+
+
 def refresh() -> None:
-    """PortAudio を初期化し直して、挿し直した機器を認識させる。"""
+    """PortAudio を初期化し直して、挿し直した機器を認識させる。
+
+    開いているストリームがあるまま初期化し直すと落ちる。
+    応答しない機器の確認スレッドが残っている間は、作り直さずに済ませる。
+    """
+    with _probe_lock:
+        busy = _probes_running
+    if busy:
+        LOG.warning("確認中の機器が %d 台あるため、作り直しは行いません", busy)
+        return
     try:
         sd._terminate()
     except Exception:
@@ -136,7 +152,10 @@ def check(device: Device, seconds: float = 1.2, timeout: float = 6.0) -> Health:
     """
     result: list[Health] = []
 
+    global _probes_running
+
     def attempt():
+        global _probes_running
         with com_initialized():
             try:
                 if device.is_input:
@@ -154,11 +173,19 @@ def check(device: Device, seconds: float = 1.2, timeout: float = 6.0) -> Health:
                     result.append(Health(True, f"{device.rate}Hz で使えます"))
             except Exception as e:
                 result.append(Health(False, describe_error(e)))
+            finally:
+                with _probe_lock:
+                    _probes_running -= 1
 
+    with _probe_lock:
+        _probes_running += 1
     t = threading.Thread(target=attempt, daemon=True)
     t.start()
     t.join(timeout)
     if not result:
+        # スレッドは止められない。ストリームを開いたまま残るので、
+        # この状態で PortAudio を作り直すと落ちる（refresh 側で見張る）
+        LOG.warning("%s は時間内に応答しませんでした", device.name)
         return Health(False, "応答なし（このドライバでは使えません）")
     return result[0]
 
