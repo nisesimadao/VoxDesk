@@ -16,12 +16,75 @@ pedalboard のエディタはメインスレッドからしか開けず、閉じ
 
 from __future__ import annotations
 
+import ctypes
 import json
 import sys
 import threading
 import time
 
 POLL_SECONDS = 0.05  # つまみの変化を見に行く間隔
+
+# pedalboard が作るプラグインウィンドウには枠が付かず、移動も最小化もできない
+#（spotify/pedalboard の issue #386）。Windows では後から枠を付けられるので、
+# ウィンドウが出たところでスタイルを足してタイトルも入れる。
+WS_CAPTION = 0x00C00000
+WS_SYSMENU = 0x00080000
+WS_MINIMIZEBOX = 0x00020000
+GWL_STYLE = -16
+SWP_NOSIZE = 0x0001
+SWP_NOZORDER = 0x0004
+SWP_FRAMECHANGED = 0x0020
+
+
+def _decorate_windows(title: str, offset: int) -> None:
+    """自プロセスのプラグインウィンドウに枠とタイトルを付ける（Windows のみ）。"""
+    if sys.platform != "win32":
+        return
+    user32 = ctypes.windll.user32
+    pid = ctypes.windll.kernel32.GetCurrentProcessId()
+    found: list[int] = []
+
+    @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+    def collect(hwnd, _lparam):
+        owner = ctypes.c_ulong()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+        if owner.value == pid and user32.IsWindowVisible(hwnd):
+            found.append(hwnd)
+        return True
+
+    user32.EnumWindows(collect, None)
+    for hwnd in found:
+        try:
+            style = user32.GetWindowLongPtrW(hwnd, GWL_STYLE)
+            user32.SetWindowLongPtrW(
+                hwnd, GWL_STYLE, style | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX)
+            user32.SetWindowTextW(hwnd, title)
+            # 複数開いたときに左上で重ならないよう、少しずつずらす
+            user32.SetWindowPos(hwnd, None, 80 + offset * 40, 60 + offset * 40, 0, 0,
+                                SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED)
+            user32.SetForegroundWindow(hwnd)
+        except Exception:
+            continue
+
+
+def window_styles() -> list[int]:
+    """検証用。自プロセスの可視ウィンドウのスタイル値を返す。"""
+    if sys.platform != "win32":
+        return []
+    user32 = ctypes.windll.user32
+    pid = ctypes.windll.kernel32.GetCurrentProcessId()
+    styles: list[int] = []
+
+    @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+    def collect(hwnd, _lparam):
+        owner = ctypes.c_ulong()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+        if owner.value == pid and user32.IsWindowVisible(hwnd):
+            styles.append(user32.GetWindowLongPtrW(hwnd, GWL_STYLE))
+        return True
+
+    user32.EnumWindows(collect, None)
+    return styles
 
 
 def send(payload: dict) -> None:
@@ -98,8 +161,23 @@ def main() -> int:
                 previous = current
                 send({"type": "params", "values": changed})
 
+    title = sys.argv[2] if len(sys.argv) > 2 else "プラグイン"
+    offset = int(sys.argv[3]) if len(sys.argv) > 3 else 0
+
+    def decorate_when_shown() -> None:
+        """ウィンドウが出たら枠を付ける。出るまで少し待つ必要がある。"""
+        for _ in range(50):
+            if close_event.is_set():
+                return
+            time.sleep(0.1)
+            if window_styles():
+                _decorate_windows(title, offset)
+                send({"type": "decorated", "styles": window_styles()})
+                return
+
     threading.Thread(target=handle_commands, daemon=True).start()
     threading.Thread(target=watch_params, daemon=True).start()
+    threading.Thread(target=decorate_when_shown, daemon=True).start()
 
     send({"type": "ready", "count": len(plugin.parameters)})
     try:

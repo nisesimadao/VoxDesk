@@ -5,7 +5,21 @@
 
 外部の再生ソフトやプラグインは不要です。Python とそのライブラリだけで動きます。
 
-## 使い方
+## 入手する
+
+[リリースページ](../../releases/latest) から、お使いの OS のものを落としてください。
+
+| OS | ファイル | 手順 |
+|---|---|---|
+| Windows | `*-windows-x64-setup.exe` | 実行してインストール |
+| macOS (Apple Silicon) | `*-macos-arm64.dmg` | 開いて Applications へドラッグ |
+| macOS (Intel) | `*-macos-x86_64.dmg` | 同上 |
+| Linux | `*-linux-x86_64.tar.gz` | 展開して `./KaraokeStudio` |
+
+macOS は署名していないため、初回は右クリック →「開く」で許可してください。
+Linux は `sudo apt install libportaudio2` が必要です。
+
+## ソースから動かす
 
 | OS | 起動方法 |
 |---|---|
@@ -131,5 +145,34 @@ Windows / macOS / Linux で動く作りにしています。OS ごとの違い�
 
 開発は Windows 11 + RTX 3090 で行い、macOS と Linux では OS 分岐のロジックのみ検証しています
 （実機での動作確認は未実施）。
+
+## 配布物の作り方
+
+`v1.0.0` のようなタグを push すると、GitHub Actions が Windows / macOS (Intel・Apple Silicon) /
+Linux 向けをまとめて作り、リリースに並べます。手元で作るなら次のとおりです。
+
+```
+pip install pyinstaller
+pyinstaller --noconfirm --clean packaging/KaraokeStudio.spec
+```
+
+`dist/KaraokeStudio/` に一式ができます。Windows のインストーラは Inno Setup で
+`packaging/installer.iss` をコンパイルすると作れます。
+
+配布物には torch / demucs を含めていません（3 GB を超え、GitHub のリリースは 1 ファイル 2 GB まで）。
+ボーカル除去を使う場合はソースから導入してください。
+
+## プラグイン画面の仕組み
+
+pedalboard の `show_editor()` はメインスレッドからしか呼べず、閉じるまで戻ってきません
+（[spotify/pedalboard#386](https://github.com/spotify/pedalboard/issues/386)）。
+そのまま呼ぶとアプリ全体が停止するため、`vst_editor_host.py` を別プロセスとして起動し、
+標準入出力の JSON でつまみの値をやりとりしています。同じ理由で報告されている
+「ウィンドウを動かせない」「複数開くと左上で重なる」も、プロセス分離と
+ウィンドウスタイルの付与で解消しています。
+
+音を処理しているのは本体側のインスタンスなので、エディタ内のメーター表示は動きません。
+これを直すにはプラグインごとに音声処理を別プロセスへ移す（共有メモリでやりとりする）
+必要があり、遅延と複雑さが増すため採用していません。
 
 再生する動画の扱いは、各サービスの利用規約と著作権法に従ってください。

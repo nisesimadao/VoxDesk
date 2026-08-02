@@ -22,6 +22,16 @@ import queue
 import subprocess
 import sys
 import threading
+
+# プラグイン画面用の子プロセスは、この下の重い読み込み（numpy / 音声 / 動画）を
+# 必要としない。インストーラ版では自分自身を起動するため、ここで先に分岐して
+# 起動を数秒短くする。
+if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "--vst-editor":
+    import vst_editor_host
+
+    sys.argv = [sys.argv[0], *sys.argv[2:]]
+    sys.exit(vst_editor_host.main())
+
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -880,11 +890,19 @@ class KaraokeApp(tk.Tk):
             self.close_vst_editor(slot)
             return
 
-        host = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vst_editor_host.py")
+        # 名前と表示位置を渡す。複数開いても重ならないようずらして出す
+        arguments = [slot.path, slot.name, str(len(self.editors))]
+        if getattr(sys, "frozen", False):
+            # インストーラ版には .py が無いので、自分自身を別モードで起動する
+            command = [sys.executable, "--vst-editor", *arguments]
+        else:
+            host = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "vst_editor_host.py")
+            command = [sys.executable, host, *arguments]
         flags = subprocess.CREATE_NO_WINDOW if platform_support.WINDOWS else 0
         try:
             proc = subprocess.Popen(
-                [sys.executable, host, slot.path],
+                command,
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 text=True, encoding="utf-8", bufsize=1, creationflags=flags,
             )
@@ -951,6 +969,8 @@ class KaraokeApp(tk.Tk):
             # エディタで動かしたつまみを、実際に音が通っている方へ反映する
             slot.apply_parameter_state(message.get("values", {}))
             self._refresh_param_values()
+        elif kind == "decorated":
+            pass  # ウィンドウに枠を付けた。表示上の変化だけなので何もしない
         elif kind == "error":
             messagebox.showerror(APP_TITLE,
                                  f"{slot.name} の画面を開けませんでした:\n{message.get('message')}")
