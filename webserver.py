@@ -74,8 +74,9 @@ class Remote:
 
     def __init__(self, app):
         self.app = app
-        self.queue: list[dict] = []
-        self._lock = threading.Lock()
+        # 予約は本体が持っている。リモコンを閉じても残るし、
+        # 本体の画面とスマホで同じものを見ることになる
+        self.queue = app.queue
 
     # ---------- 読み取り ----------
     def snapshot(self) -> dict:
@@ -95,8 +96,7 @@ class Remote:
                     next_line = lyrics.lines[index + 1].text
             elif lyrics.lines:
                 next_line = lyrics.lines[0].text
-        with self._lock:
-            queue = list(self.queue)
+        queue = [entry.as_dict() for entry in self.queue.list()]
         return {
             "state": player.state,
             "title": (track.title if track is not None else "")
@@ -136,9 +136,7 @@ class Remote:
         elif action == "next":
             # 予約が空のときは何もしない。歌っている最中に押されて
             # 曲が止まると、取り返しがつかない
-            with self._lock:
-                waiting = bool(self.queue)
-            if not waiting:
+            if not len(self.queue):
                 return {"ok": False, "error": "予約がありません"}
             app.post(self.play_next)
         elif action == "seek":
@@ -165,9 +163,10 @@ class Remote:
 
     # ---------- 予約 ----------
     def enqueue(self, video_id: str, title: str) -> dict:
-        with self._lock:
-            self.queue.append({"id": video_id, "title": title})
-            waiting = len(self.queue)
+        import playqueue
+
+        waiting = self.queue.add(playqueue.Entry(
+            title=title, video_id=video_id, added_by="スマホ"))
         # 何も鳴っていなければ、そのまま歌い始められるようにする
         if self.app.player.state in ("stopped", "ended", "error"):
             self.app.post(self.play_next)
@@ -175,25 +174,17 @@ class Remote:
         return {"ok": True, "waiting": waiting}
 
     def dequeue(self, index: int) -> dict:
-        with self._lock:
-            if 0 <= index < len(self.queue):
-                self.queue.pop(index)
+        self.queue.remove(index)
         return {"ok": True}
 
     def play_next(self) -> None:
         """予約の先頭を再生する。メインスレッドから呼ばれる。"""
-        with self._lock:
-            entry = self.queue.pop(0) if self.queue else None
-        if entry is None:
+        if not self.app.play_next_in_queue():
             self.app.stop_music("予約はもうありません")
-            return
-        self.app.play_url(f"https://www.youtube.com/watch?v={entry['id']}")
 
     def song_finished(self) -> None:
-        """1 曲終わったときにアプリから呼ばれる。"""
-        with self._lock:
-            has_next = bool(self.queue)
-        if has_next:
+        """1 曲終わったときにアプリから呼ばれる（本体が予約を進める）。"""
+        if len(self.queue):
             self.play_next()
 
     # ---------- 検索 ----------

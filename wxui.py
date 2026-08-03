@@ -30,6 +30,7 @@ import juce_thread
 import mic_chain
 import music_search
 import platform_support
+import playqueue
 import webserver
 from mic_chain import MicChain, available_vst3, karaoke_preset
 from player import AVPlayer
@@ -337,6 +338,9 @@ class VoxDesk(wx.Frame):
         self.current_track: music_search.Track | None = None
         self.current_local_path: str | None = None
         self.current_lyrics = None
+        # 次に歌う曲の並び。本体からもスマホからも同じものを触る
+        self.queue = playqueue.PlayQueue(
+            on_change=lambda: wx.CallAfter(self._refresh_queue))
         self.separator_capability = None
         self.remote = None
         self.last_frame = None
@@ -534,6 +538,9 @@ class VoxDesk(wx.Frame):
         go = wx.Button(tab, label="検索")
         go.Bind(wx.EVT_BUTTON, lambda _e: self.search())
         search.Add(go, 0, wx.LEFT, 6)
+        enqueue = wx.Button(tab, label="予約に追加")
+        enqueue.Bind(wx.EVT_BUTTON, lambda _e: self.enqueue_selected())
+        search.Add(enqueue, 0, wx.LEFT, 6)
         self.offvocal = wx.CheckBox(tab, label="オフボーカルを優先")
         self.offvocal.SetValue(bool(self.cfg.get("prefer_off_vocal", True)))
         search.Add(self.offvocal, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 8)
@@ -568,7 +575,11 @@ class VoxDesk(wx.Frame):
         extra.Add(self.lyric_status, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 6)
         sizer.Add(extra, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
 
-        self.results = wx.ListCtrl(tab, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
+        # 検索結果と予約は同じ場所を分け合う。縦幅は限られていて、
+        # 同時に見たいものでもない
+        self.lists = wx.Notebook(tab)
+        self.results = wx.ListCtrl(self.lists,
+                                   style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
         for index, (text, width, align) in enumerate(
                 (("オフボーカル度", 110, wx.LIST_FORMAT_CENTRE),
                  ("長さ", 60, wx.LIST_FORMAT_CENTRE),
@@ -580,10 +591,12 @@ class VoxDesk(wx.Frame):
         # 幅が余ると右端に空白の列ができて間の抜けた見た目になる。
         # 余った分はタイトルに渡す
         self.results.Bind(wx.EVT_SIZE, lambda e: (stretch_column(self.results, 2), e.Skip()))
-        self.results.SetMinSize(self.dip(-1, 150))
+        self.lists.AddPage(self.results, "検索結果")
+        self.lists.AddPage(self._build_queue_page(self.lists), "予約")
+        self.lists.SetMinSize(self.dip(-1, 170))
         # 一覧を固定の高さにすると、曲が 6 行ちょっとしか見えないのに
         # 映像の黒い枠が画面の半分以上を占める。両方を伸ばして分け合う
-        sizer.Add(self.results, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 8)
+        sizer.Add(self.lists, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 8)
 
         self.video = VideoView(tab)
         self.video.Bind(wx.EVT_LEFT_DCLICK, lambda _e: self.toggle_play())
@@ -636,6 +649,132 @@ class VoxDesk(wx.Frame):
         self.music_status = hint_label(tab, "曲名やアーティスト名で検索してください。")
         sizer.Add(self.music_status, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         tab.SetSizer(sizer)
+
+    # ---------- 予約 ----------
+    def _build_queue_page(self, parent) -> wx.Panel:
+        page = wx.Panel(parent)
+        sizer = wx.BoxSizer(wx.VERTICAL)
+        self.queue_list = wx.ListCtrl(page, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
+        for index, (text, width, align) in enumerate(
+                (("順", 46, wx.LIST_FORMAT_CENTRE),
+                 ("曲", 700, wx.LIST_FORMAT_LEFT),
+                 ("入れた人", 90, wx.LIST_FORMAT_CENTRE))):
+            self.queue_list.InsertColumn(index, text, format=align,
+                                         width=self.FromDIP(width))
+        self.queue_list.Bind(wx.EVT_SIZE,
+                             lambda e: (stretch_column(self.queue_list, 1), e.Skip()))
+        self.queue_list.Bind(wx.EVT_LIST_ITEM_ACTIVATED,
+                             lambda _e: self.play_queued_now())
+        sizer.Add(self.queue_list, 1, wx.EXPAND)
+
+        buttons = wx.BoxSizer(wx.HORIZONTAL)
+        for label, handler, width in (
+                ("▲", lambda: self.move_queued(-1), 36),
+                ("▼", lambda: self.move_queued(1), 36),
+                ("この曲をすぐ歌う", self.play_queued_now, 150),
+                ("取り消す", self.remove_queued, 90),
+                ("全部消す", self.clear_queue, 90)):
+            button = wx.Button(page, label=label, size=self.dip(width, -1))
+            button.Bind(wx.EVT_BUTTON, lambda _e, h=handler: h())
+            buttons.Add(button, 0, wx.RIGHT, 4)
+        buttons.AddStretchSpacer()
+        self.queue_hint = hint_label(page, "検索結果で曲を選んで「予約に追加」。"
+                                           "曲が終わると自動で次へ進みます")
+        buttons.Add(self.queue_hint, 0, wx.ALIGN_CENTER_VERTICAL)
+        sizer.Add(buttons, 0, wx.EXPAND | wx.TOP, 4)
+        page.SetSizer(sizer)
+        return page
+
+    def _refresh_queue(self) -> None:
+        """予約の一覧と見出しを、いまの中身に合わせる。"""
+        entries = self.queue.list()
+        selected = self.queue_list.GetFirstSelected()
+        self.queue_list.DeleteAllItems()
+        for row, entry in enumerate(entries):
+            self.queue_list.InsertItem(row, str(row + 1))
+            self.queue_list.SetItem(row, 1, entry.title)
+            self.queue_list.SetItem(row, 2, entry.added_by or "本体")
+        if entries:
+            target = min(max(0, selected), len(entries) - 1)
+            self.queue_list.Select(target)
+        self.lists.SetPageText(1, f"予約 ({len(entries)})" if entries else "予約")
+
+    def enqueue_selected(self) -> None:
+        """検索結果で選んでいる曲を予約に足す。"""
+        index = self.results.GetFirstSelected()
+        if index < 0 or index >= len(self.tracks):
+            self.music_status.SetLabel("一覧から曲を選んでください。")
+            return
+        track = self.tracks[index]
+        position = self.queue.add(
+            playqueue.Entry(title=track.title, video_id=track.id, added_by="本体"))
+        self.music_status.SetLabel(f"予約しました（{position} 番目）: {track.title}")
+        # 何も鳴っていなければ、そのまま歌い始められるようにする
+        if self.player.state in ("stopped", "ended", "error"):
+            self.play_next_in_queue()
+
+    def selected_queue_index(self) -> int:
+        return self.queue_list.GetFirstSelected()
+
+    def move_queued(self, delta: int) -> None:
+        index = self.selected_queue_index()
+        if index < 0:
+            return
+        moved = self.queue.move(index, delta)
+        self.queue_list.Select(moved)
+
+    def remove_queued(self) -> None:
+        index = self.selected_queue_index()
+        if index < 0:
+            return
+        entry = self.queue.remove(index)
+        if entry:
+            self.music_status.SetLabel(f"予約を取り消しました: {entry.title}")
+
+    def clear_queue(self) -> None:
+        if not len(self.queue):
+            return
+        if self.ask(f"予約を {len(self.queue)} 件すべて取り消しますか？"):
+            self.music_status.SetLabel(f"{self.queue.clear()} 件の予約を取り消しました")
+
+    def play_queued_now(self) -> None:
+        """選んでいる予約を、順番を飛ばしてすぐ歌う。"""
+        index = self.selected_queue_index()
+        if index < 0:
+            return
+        entry = self.queue.remove(index)
+        if entry:
+            self._play_entry(entry)
+
+    def play_next_in_queue(self) -> bool:
+        """予約の先頭を再生する。予約が無ければ False。"""
+        entry = self.queue.pop()
+        if entry is None:
+            return False
+        self._play_entry(entry)
+        return True
+
+    def _play_entry(self, entry) -> None:
+        if entry.path:
+            self.current_track = None
+            self.current_local_path = entry.path
+            out = self.selected_device("output")
+            self.player.stop(wait=False)
+            self.player.set_display_size(*self.video.GetClientSize())
+            self.player.open(entry.path, None, {}, device=out.index if out else None)
+            self.music_status.SetLabel(f"再生中: {entry.title}")
+            self.play_button.SetLabel("⏸ 一時停止")
+            self.request_lyrics(entry.title, self.player.duration)
+            return
+        self.play_url(entry.url)
+
+    def _on_song_finished(self) -> None:
+        """1 曲終わったとき。予約があれば次へ、無ければ止める。"""
+        if len(self.queue):
+            self.music_status.SetLabel("次の曲へ進みます…")
+            self.play_next_in_queue()
+            return
+        self.stop_music("再生が終わりました")
 
     def _on_music_volume(self, _event) -> None:
         self.cfg["music_volume"] = self.music_volume.GetFloat()
@@ -2563,9 +2702,7 @@ class VoxDesk(wx.Frame):
                 self.seek.SetValue(int(min(1000, position / duration * 1000)))
             self._update_lyric_display()
             if self.player.finished:
-                self.stop_music("再生が終わりました")
-                if self.remote is not None:  # 予約が入っていれば次の曲へ
-                    self.remote.song_finished()
+                self._on_song_finished()  # 予約があれば次の曲へ
 
     def _update_quality_label(self) -> None:
         """遅延と途切れ回数を出す。途切れが増えたら直し方も添える。"""

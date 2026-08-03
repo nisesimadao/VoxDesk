@@ -56,6 +56,7 @@ import juce_thread
 import mic_chain
 import music_search
 import platform_support
+import playqueue
 from mic_chain import MicChain, available_vst3, karaoke_preset
 from player import AVPlayer
 from router import Router
@@ -106,6 +107,9 @@ class KaraokeApp(tk.Tk):
         self.current_lyrics = None
         self.remote = None      # スマホからのリモコン（設定で入にしたときだけ動く）
         self.last_frame = None  # いま出している映像。リモコンへ転送するのに使う
+        # 予約。この画面には一覧を出していないが、スマホからは使えるようにする
+        # （一覧つきで扱えるのは今の画面 wxui の方）
+        self.queue = playqueue.PlayQueue()
         self.separator_capability = None
         self.editors: dict[int, dict] = {}  # 開いているプラグイン画面（別プロセス）
         self._photo: ImageTk.PhotoImage | None = None
@@ -2450,6 +2454,14 @@ class KaraokeApp(tk.Tk):
         if position > 1.0:  # 元の位置から続ける
             self.after(1200, lambda: self.player.seek(position))
 
+    def play_next_in_queue(self) -> bool:
+        """予約の先頭を再生する。予約が無ければ False。"""
+        entry = self.queue.pop()
+        if entry is None:
+            return False
+        self.play_url(entry.url)
+        return True
+
     def set_music_volume(self, volume: float) -> None:
         """伴奏の音量を変える（スマホのリモコンからも呼ばれる）。"""
         self.cfg["music_volume"] = volume
@@ -2571,9 +2583,8 @@ class KaraokeApp(tk.Tk):
                 self.position_var.set(min(1000.0, position / duration * 1000.0))
             self._update_lyric_display()
             if self.player.finished:
-                self.stop_music("再生が終わりました")
-                if self.remote is not None:  # 予約が入っていれば次の曲へ
-                    self.remote.song_finished()
+                if not self.play_next_in_queue():  # 予約があれば次の曲へ
+                    self.stop_music("再生が終わりました")
 
         self.after(33, self._tick)
 
