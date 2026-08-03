@@ -17,13 +17,17 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import applog
 
 LOG = applog.get(__name__)
 
+# 行単位の歌詞の元。アカウント不要で、曲名だけでも探せる（当たりが広い）
 API = "https://lrclib.net/api"
+# こちらは LRCLIB を元に、1 文字ずつの頭出しを足しているところ。
+# 曲名とアーティストの両方が要るぶん厳しいので、当てた後の上乗せに使う
+HUB_API = "https://lrchub.coreone.work/api"
 USER_AGENT = "VoxDesk (https://github.com/nisesimadao/VoxDesk)"
 CACHE_SECONDS = 3600
 
@@ -57,6 +61,21 @@ _cache: dict[str, tuple[float, object]] = {}
 class Line:
     time: float
     text: str
+    # 1 文字ずつの頭出し（LRCHub2 が持っている場合だけ入る）。
+    # (その文字が始まる時刻, 文字) の並び
+    marks: list[tuple[float, str]] = field(default_factory=list)
+
+    def sung(self, position: float) -> int:
+        """その行のうち、いま何文字目まで歌い終えたか。"""
+        if not self.marks:
+            return 0
+        count = 0
+        for time_at, text in self.marks:
+            if time_at <= position:
+                count += len(text)
+            else:
+                break
+        return count
 
 
 @dataclass
@@ -66,21 +85,32 @@ class Lyrics:
     duration: float | None
     lines: list[Line] = field(default_factory=list)
     plain: str = ""
+    source: str = "LRCLIB"
 
     @property
     def synced(self) -> bool:
         return bool(self.lines)
 
-    def at(self, position: float) -> tuple[str, str]:
-        """いまの行と次の行を返す。"""
-        if not self.lines:
-            return "", ""
+    @property
+    def word_by_word(self) -> bool:
+        """1 文字ずつの頭出しを持っているか。"""
+        return any(line.marks for line in self.lines)
+
+    def index_at(self, position: float) -> int:
+        """いま歌っている行の番号。まだ始まっていなければ -1。"""
         index = -1
         for i, line in enumerate(self.lines):
             if line.time <= position:
                 index = i
             else:
                 break
+        return index
+
+    def at(self, position: float) -> tuple[str, str]:
+        """いまの行と次の行を返す。"""
+        if not self.lines:
+            return "", ""
+        index = self.index_at(position)
         current = self.lines[index].text if index >= 0 else ""
         following = self.lines[index + 1].text if index + 1 < len(self.lines) else ""
         return current, following
@@ -206,6 +236,75 @@ def search(track: str, artist: str = "", duration: float | None = None,
     return results[:limit]
 
 
+def parse_dynamic(text: str) -> list[Line]:
+    """1 文字ずつ頭出しの付いた歌詞を読む。
+
+    LRCHub2 が返す形はこう:
+        [00:00.00]<00:00.00>夢<00:00.38>な<00:00.60>ら<00:00.77>ば
+    行の頭の時刻に続いて、文字ごとの始まりが入っている。
+    """
+    lines: list[Line] = []
+    for row in (text or "").splitlines():
+        head = re.match(r"\[(\d+):(\d+(?:[.:]\d+)?)\]", row)
+        if not head:
+            continue
+        start = int(head.group(1)) * 60 + float(head.group(2).replace(":", "."))
+        marks: list[tuple[float, str]] = []
+        for minute, second, piece in re.findall(
+                r"<(\d+):(\d+(?:[.:]\d+)?)>([^<]*)", row[head.end():]):
+            if piece:
+                marks.append((int(minute) * 60 + float(second.replace(":", ".")), piece))
+        body = "".join(piece for _, piece in marks)
+        if not body:  # 文字ごとの印が無い行は、ただの行として扱う
+            body = re.sub(r"\[[^\]]*\]|<[^>]*>", "", row).strip()
+        if body:
+            lines.append(Line(start, body, marks))
+    lines.sort(key=lambda line: line.time)
+    return lines
+
+
+def _hub_request(params: dict) -> dict | None:
+    """LRCHub2 に聞く。落ちていても歌の邪魔をしないよう、黙って None を返す。"""
+    url = f"{HUB_API}/lyrics?" + urllib.parse.urlencode(params)
+    cached = _cache.get(url)
+    if cached and time.time() - cached[0] < CACHE_SECONDS:
+        return cached[1]
+    request = urllib.request.Request(
+        url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=8) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except Exception as e:
+        LOG.info("LRCHub2 に届きませんでした: %s", e)
+        return None
+    _cache[url] = (time.time(), data)
+    return data
+
+
+def upgrade_to_word_by_word(entry: Lyrics) -> Lyrics:
+    """1 文字ずつの頭出しを持っていたら、そちらに差し替える。
+
+    LRCHub2 は LRCLIB を元にしていて、そこに文字ごとの時刻を足したものを
+    持っていることがある。カラオケでは、いま歌う文字が色で進む方が分かり
+    やすいので、あれば使う。無ければ行単位のまま。
+    """
+    if not entry.track or not entry.artist or entry.word_by_word:
+        return entry
+    data = _hub_request({"track": entry.track, "artist": entry.artist})
+    if not data or not data.get("ok"):
+        return entry
+    lines = parse_dynamic(data.get("dynamic_lyrics") or data.get("dynamic_lrc") or "")
+    if not any(line.marks for line in lines):
+        return entry
+    offset = float(data.get("offset_ms") or 0) / 1000.0
+    if offset:
+        for line in lines:
+            line.time += offset
+            line.marks = [(at + offset, text) for at, text in line.marks]
+    LOG.info("LRCHub2 の 1 文字ずつの歌詞に切り替えました（%d 行）", len(lines))
+    return replace(entry, lines=lines, source="LRCHub2")
+
+
 def best_match(title: str, duration: float | None = None) -> Lyrics | None:
     """動画のタイトルから、いちばんそれらしい歌詞を選ぶ。"""
     track, artist = clean_title(title)
@@ -219,4 +318,4 @@ def best_match(title: str, duration: float | None = None) -> Lyrics | None:
     # 長さが大きく違うものは、別の曲を掴んでいる可能性が高い
     if duration and top.duration and abs(top.duration - duration) > 45:
         LOG.info("長さが合いません（%.0f 秒差）", abs(top.duration - duration))
-    return top
+    return upgrade_to_word_by_word(top)

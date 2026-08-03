@@ -78,6 +78,7 @@ MANUAL_PRESET = "手動調整"
 DARK = wx.Colour(0x10, 0x10, 0x14)
 LYRIC_NOW = wx.Colour(0xF2, 0xF4, 0xF8)
 LYRIC_NEXT = wx.Colour(0x8A, 0x90, 0xA0)
+LYRIC_SUNG = wx.Colour(0xFF, 0x5A, 0x7A)  # 歌い終えたところ
 HINT = wx.Colour(0x66, 0x66, 0x72)
 
 
@@ -191,6 +192,62 @@ def hint_label(parent, text: str = "") -> wx.StaticText:
     label = wx.StaticText(parent, label=text)
     label.SetForegroundColour(wx.SystemSettings.GetColour(wx.SYS_COLOUR_GRAYTEXT))
     return label
+
+
+class LyricView(wx.Panel):
+    """歌詞を出す枠。
+
+    1 文字ずつの頭出しがある曲では、歌い終えた分だけ色を変えて進める
+    （カラオケの色変わりと同じ）。無ければ行がそのまま出るだけ。
+    """
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.SetBackgroundColour(DARK)
+        self.SetBackgroundStyle(wx.BG_STYLE_PAINT)
+        self._now = ""
+        self._sung = 0
+        self._next = ""
+        base = self.GetFont()
+        self._now_font = wx.Font(base)
+        self._now_font.SetPointSize(base.GetPointSize() + 8)
+        self._now_font.MakeBold()
+        self._next_font = wx.Font(base)
+        self._next_font.SetPointSize(base.GetPointSize() + 1)
+        self.SetMinSize(self.FromDIP(wx.Size(-1, 78)))
+        self.Bind(wx.EVT_PAINT, self._on_paint)
+
+    def show(self, now: str, sung: int, following: str) -> None:
+        if (now, sung, following) == (self._now, self._sung, self._next):
+            return
+        self._now, self._sung, self._next = now, sung, following
+        self.Refresh(eraseBackground=False)
+
+    def _on_paint(self, _event) -> None:
+        dc = wx.AutoBufferedPaintDC(self)
+        dc.SetBackground(wx.Brush(DARK))
+        dc.Clear()
+        width, height = self.GetClientSize()
+
+        dc.SetFont(self._now_font)
+        text_width, text_height = dc.GetTextExtent(self._now or " ")
+        x, y = (width - text_width) // 2, 6
+        if self._sung > 0:
+            # 歌い終えた分と、これからの分を続けて描く
+            done = self._now[:self._sung]
+            done_width, _ = dc.GetTextExtent(done)
+            dc.SetTextForeground(LYRIC_SUNG)
+            dc.DrawText(done, x, y)
+            dc.SetTextForeground(LYRIC_NOW)
+            dc.DrawText(self._now[self._sung:], x + done_width, y)
+        else:
+            dc.SetTextForeground(LYRIC_NOW)
+            dc.DrawText(self._now, x, y)
+
+        dc.SetFont(self._next_font)
+        next_width, _ = dc.GetTextExtent(self._next or " ")
+        dc.SetTextForeground(LYRIC_NEXT)
+        dc.DrawText(self._next, (width - next_width) // 2, y + text_height + 4)
 
 
 def wrapped_label(parent, text: str) -> wx.StaticText:
@@ -532,20 +589,7 @@ class VoxDesk(wx.Frame):
         self.video.Bind(wx.EVT_LEFT_DCLICK, lambda _e: self.toggle_play())
         sizer.Add(self.video, 2, wx.EXPAND | wx.ALL, 8)
 
-        self.lyric_panel = wx.Panel(tab)
-        self.lyric_panel.SetBackgroundColour(DARK)
-        lyric_sizer = wx.BoxSizer(wx.VERTICAL)
-        self.lyric_now = wx.StaticText(self.lyric_panel, label="", style=wx.ALIGN_CENTER)
-        font = self.lyric_now.GetFont()
-        font.SetPointSize(font.GetPointSize() + 6)
-        font.MakeBold()
-        self.lyric_now.SetFont(font)
-        self.lyric_now.SetForegroundColour(LYRIC_NOW)
-        lyric_sizer.Add(self.lyric_now, 0, wx.EXPAND | wx.TOP, 4)
-        self.lyric_next = wx.StaticText(self.lyric_panel, label="", style=wx.ALIGN_CENTER)
-        self.lyric_next.SetForegroundColour(LYRIC_NEXT)
-        lyric_sizer.Add(self.lyric_next, 0, wx.EXPAND | wx.BOTTOM, 4)
-        self.lyric_panel.SetSizer(lyric_sizer)
+        self.lyric_panel = LyricView(tab)
         self.lyric_panel.Hide()  # 歌詞が取れたときだけ出す
         sizer.Add(self.lyric_panel, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 8)
 
@@ -887,8 +931,7 @@ class VoxDesk(wx.Frame):
         self.run_async(work, done, on_error=failed)
 
     def _hide_lyrics(self) -> None:
-        self.lyric_now.SetLabel("")
-        self.lyric_next.SetLabel("")
+        self.lyric_panel.show("", 0, "")
         if self.lyric_panel.IsShown():
             self.lyric_panel.Hide()
             self.karaoke_tab.Layout()
@@ -902,13 +945,18 @@ class VoxDesk(wx.Frame):
             self.request_lyrics(self.current_track.title, self.player.duration)
 
     def _update_lyric_display(self) -> None:
-        if self.current_lyrics is None or not self.current_lyrics.synced:
+        entry = self.current_lyrics
+        if entry is None or not entry.synced:
             return
-        now, following = self.current_lyrics.at(self.player.position)
-        if self.lyric_now.GetLabel() != now:
-            self.lyric_now.SetLabel(now)
-            self.lyric_next.SetLabel(following)
-            self.lyric_panel.Layout()
+        position = self.player.position
+        index = entry.index_at(position)
+        if index < 0:
+            self.lyric_panel.show("", 0, entry.lines[0].text if entry.lines else "")
+            return
+        line = entry.lines[index]
+        following = entry.lines[index + 1].text if index + 1 < len(entry.lines) else ""
+        # 1 文字ずつの頭出しがある曲は、歌った分だけ色を進める
+        self.lyric_panel.show(line.text, line.sung(position), following)
 
     def choose_lyrics(self) -> None:
         """歌詞を手で選び直す。"""

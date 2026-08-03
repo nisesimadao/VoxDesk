@@ -85,8 +85,16 @@ class Remote:
         lyrics = getattr(app, "current_lyrics", None)
         position = player.position if player.state in ("playing", "paused") else 0.0
         current_line = next_line = ""
+        sung = 0
         if lyrics is not None and lyrics.synced:
-            current_line, next_line = lyrics.at(position)
+            index = lyrics.index_at(position)
+            if index >= 0:
+                line = lyrics.lines[index]
+                current_line, sung = line.text, line.sung(position)
+                if index + 1 < len(lyrics.lines):
+                    next_line = lyrics.lines[index + 1].text
+            elif lyrics.lines:
+                next_line = lyrics.lines[0].text
         with self._lock:
             queue = list(self.queue)
         return {
@@ -99,6 +107,7 @@ class Remote:
             "volume": float(app.cfg.get("music_volume", 1.0)),
             "queue": queue,
             "lyric": current_line,
+            "lyric_sung": sung,  # いま歌い終えた文字数（1 文字ずつの曲だけ）
             "lyric_next": next_line,
             "video": self.video_kind(),
         }

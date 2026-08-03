@@ -34,6 +34,7 @@ header h1 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: .04em;
   padding: 12px 14px; min-height: 62px; border-bottom: 1px solid var(--line);
 }
 .lyric .now { font-size: 19px; font-weight: 700; line-height: 1.35; }
+.lyric .now .sung { color: var(--accent); }  /* 歌い終えたところ */
 .lyric .next { font-size: 14px; color: var(--dim); margin-top: 4px; }
 
 .now-playing { padding: 10px 14px; border-bottom: 1px solid var(--line); }
@@ -227,6 +228,20 @@ function syncVideo(position, playing) {
   if (!playing && !video.paused) video.pause();
 }
 
+// 1 文字ずつの頭出しがある曲は、歌い終えたところの色を変える
+function showLyric(text, sung) {
+  const box = $("lyric-now");
+  if (!text) { box.textContent = "—"; return; }
+  sung = Math.max(0, Math.min(sung, text.length));
+  if (!sung) { box.textContent = text; return; }
+  box.textContent = "";
+  const done = document.createElement("span");
+  done.className = "sung";
+  done.textContent = text.slice(0, sung);
+  box.appendChild(done);
+  box.appendChild(document.createTextNode(text.slice(sung)));
+}
+
 function render(next) {
   state = next;
   updateStage(state.video);
@@ -238,7 +253,7 @@ function render(next) {
     $("seek").value = Math.min(1000, (state.position / state.duration) * 1000);
   }
   $("key").textContent = state.key ? (state.key > 0 ? "+" : "") + state.key : "±0";
-  $("lyric-now").textContent = state.lyric || "—";
+  showLyric(state.lyric || "", state.lyric_sung || 0);
   $("lyric-next").textContent = state.lyric_next || "";
   syncVideo(state.position, playing);
   renderQueue(state.queue || []);
