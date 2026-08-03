@@ -12,6 +12,7 @@ music_search / lyrics / ranking / devices / separator）がすべて持ってい
 
 from __future__ import annotations
 
+import ctypes
 import os
 import re
 import subprocess
@@ -50,6 +51,27 @@ from uicommon import (
 )
 
 LOG = applog.get(__name__)
+
+
+def _enable_high_dpi() -> None:
+    """画面の拡大率をアプリ側で扱うと OS に伝える。
+
+    これを言わないと Windows は 100% 用に描かせてから引き伸ばすので、
+    150% の画面では文字も部品も全部ぼやける。窓を 1 つも作る前に
+    呼ぶ必要があるため、この場所（読み込み時）で行う。
+    """
+    if not sys.platform.startswith("win"):
+        return  # macOS と Linux(GTK) は既定で正しく扱われる
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # 画面ごとに対応
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()  # 古い Windows 向け
+        except Exception:
+            pass
+
+
+_enable_high_dpi()
 
 DARK = wx.Colour(0x10, 0x10, 0x14)
 LYRIC_NOW = wx.Colour(0xF2, 0xF4, 0xF8)
@@ -105,16 +127,21 @@ class VideoView(wx.Panel):
     def __init__(self, parent):
         super().__init__(parent, style=wx.FULL_REPAINT_ON_RESIZE)
         self.SetBackgroundColour(DARK)
-        self.SetMinSize((-1, 240))
+        self.SetMinSize(self.FromDIP(wx.Size(-1, 240)))
         self._bitmap: wx.Bitmap | None = None
         self._message = "ここに映像が出ます（歌詞つき動画ならそのまま歌えます）"
         self.SetBackgroundStyle(wx.BG_STYLE_PAINT)  # ちらつきを防ぐ
         self.Bind(wx.EVT_PAINT, self._on_paint)
 
     def show_image(self, image) -> None:
-        """PIL の画像を受け取って描き直す。"""
-        wx_image = wx.Image(image.width, image.height, image.convert("RGB").tobytes())
-        self._bitmap = wx.Bitmap(wx_image)
+        """PIL の画像を受け取って描き直す。
+
+        再生側は rgb24 で渡してくるので、そのまま渡せる。念のため他の
+        形式なら直すが、毎コマ変換すると 1 枚まるごと複製することになる。
+        """
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+        self._bitmap = wx.Bitmap(wx.Image(image.width, image.height, image.tobytes()))
         self.Refresh(eraseBackground=False)
 
     def clear(self, message: str = "ここに映像が出ます") -> None:
@@ -143,6 +170,32 @@ def hint_label(parent, text: str = "") -> wx.StaticText:
     return label
 
 
+def head_label(parent, text: str) -> wx.StaticText:
+    """区画の見出し。太字にして、どこが何なのかを目で追えるようにする。"""
+    label = wx.StaticText(parent, label=text)
+    font = label.GetFont()
+    font.MakeBold()
+    label.SetFont(font)
+    return label
+
+
+def stretch_column(listing: wx.ListCtrl, index: int) -> None:
+    """余った横幅を、指定した列に足して一覧を端まで使う。"""
+    others = sum(listing.GetColumnWidth(i) for i in range(listing.GetColumnCount())
+                 if i != index)
+    room = listing.GetClientSize().width - others - 4  # 4 は枠のぶん
+    if room > 60 and abs(room - listing.GetColumnWidth(index)) > 4:
+        listing.SetColumnWidth(index, room)
+
+
+def emphasize(widget, points: int = 1) -> None:
+    """よく押す操作を、少し大きく太くする。"""
+    font = widget.GetFont()
+    font.SetPointSize(font.GetPointSize() + points)
+    font.MakeBold()
+    widget.SetFont(font)
+
+
 def boxed(parent, title: str) -> tuple[wx.StaticBoxSizer, wx.Window]:
     """枠付きの区画を作り、(sizer, 中に入れる親) を返す。"""
     box = wx.StaticBox(parent, label=title)
@@ -154,12 +207,23 @@ class VoxDesk(wx.Frame):
     URL_PATTERN = re.compile(r"https?://\S+", re.I)
     VIDEO_EXTENSIONS = (".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v")
 
+    def dip(self, width: int, height: int = -1) -> wx.Size:
+        """画面の拡大率に合わせた大きさを返す。
+
+        拡大率を自分で扱うと決めた以上、数値は実際の点の数になる。
+        150% の画面では 1.5 倍にしないと、部品が全部小さくなる。
+        """
+        return self.FromDIP(wx.Size(width, height))
+
     def __init__(self):
+        super().__init__(None, title=APP_TITLE)
+        # 画面に収まる大きさで開く。ノートでも下の再生ボタンが隠れないように
+        wanted = self.FromDIP(wx.Size(1080, 780))
         display = wx.Display().GetClientArea()
-        width = min(1080, max(820, display.width - 120))
-        height = min(780, max(560, display.height - 120))
-        super().__init__(None, title=APP_TITLE, size=(width, height))
-        self.SetMinSize((820, 560))
+        self.SetSize(min(wanted.width, display.width - 80),
+                     min(wanted.height, display.height - 80))
+        self.SetMinSize(self.dip(760, 520))
+        self.Centre()
 
         self.cfg = config.load()
         self.chain = MicChain(48000)
@@ -252,7 +316,7 @@ class VoxDesk(wx.Frame):
         bar = wx.BoxSizer(wx.HORIZONTAL)
         self.status_label = hint_label(panel, "準備完了")
         bar.Add(self.status_label, 0, wx.ALIGN_CENTER_VERTICAL)
-        self.busy_bar = wx.Gauge(panel, range=100, size=(110, 12))
+        self.busy_bar = wx.Gauge(panel, range=100, size=self.dip(110, 12))
         bar.Add(self.busy_bar, 0, wx.LEFT | wx.ALIGN_CENTER_VERTICAL, 8)
         self.busy_bar.Hide()
         bar.AddStretchSpacer()
@@ -347,7 +411,7 @@ class VoxDesk(wx.Frame):
         sizer = wx.BoxSizer(wx.VERTICAL)
 
         search = wx.BoxSizer(wx.HORIZONTAL)
-        search.Add(wx.StaticText(tab, label="曲を探す"), 0,
+        search.Add(head_label(tab, "曲を探す"), 0,
                    wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8)
         # 曲名でも、YouTube の URL を貼っても同じ欄で受ける
         self.query = wx.TextCtrl(tab, style=wx.TE_PROCESS_ENTER)
@@ -391,11 +455,18 @@ class VoxDesk(wx.Frame):
         sizer.Add(extra, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
 
         self.results = wx.ListCtrl(tab, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
-        for index, (text, width) in enumerate((("オフボーカル度", 110), ("長さ", 60),
-                                               ("タイトル", 520), ("チャンネル", 190))):
-            self.results.InsertColumn(index, text, width=width)
+        for index, (text, width, align) in enumerate(
+                (("オフボーカル度", 110, wx.LIST_FORMAT_CENTRE),
+                 ("長さ", 60, wx.LIST_FORMAT_CENTRE),
+                 ("タイトル", 560, wx.LIST_FORMAT_LEFT),
+                 ("チャンネル", 200, wx.LIST_FORMAT_LEFT))):
+            self.results.InsertColumn(index, text, format=align,
+                                      width=self.FromDIP(width))
         self.results.Bind(wx.EVT_LIST_ITEM_ACTIVATED, lambda _e: self.play_selected())
-        self.results.SetMinSize((-1, 150))
+        # 幅が余ると右端に空白の列ができて間の抜けた見た目になる。
+        # 余った分はタイトルに渡す
+        self.results.Bind(wx.EVT_SIZE, lambda e: (stretch_column(self.results, 2), e.Skip()))
+        self.results.SetMinSize(self.dip(-1, 150))
         sizer.Add(self.results, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 8)
 
         self.video = VideoView(tab)
@@ -420,13 +491,14 @@ class VoxDesk(wx.Frame):
         sizer.Add(self.lyric_panel, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 8)
 
         controls = wx.BoxSizer(wx.HORIZONTAL)
-        self.play_button = wx.Button(tab, label="▶ 再生", size=(110, -1))
+        self.play_button = wx.Button(tab, label="▶ 再生", size=self.dip(130, 38))
+        emphasize(self.play_button)  # いちばん押すもの
         self.play_button.Bind(wx.EVT_BUTTON, lambda _e: self.toggle_play())
         controls.Add(self.play_button, 0, wx.ALIGN_CENTER_VERTICAL)
-        stop = wx.Button(tab, label="■ 停止", size=(80, -1))
+        stop = wx.Button(tab, label="■ 停止", size=self.dip(80, -1))
         stop.Bind(wx.EVT_BUTTON, lambda _e: self.stop_music())
         controls.Add(stop, 0, wx.LEFT | wx.ALIGN_CENTER_VERTICAL, 6)
-        self.time_label = wx.StaticText(tab, label="--:-- / --:--", size=(96, -1))
+        self.time_label = wx.StaticText(tab, label="--:-- / --:--", size=self.dip(96, -1))
         controls.Add(self.time_label, 0, wx.LEFT | wx.ALIGN_CENTER_VERTICAL, 12)
         self.seek = wx.Slider(tab, value=0, minValue=0, maxValue=1000)
         self.seek.Bind(wx.EVT_SCROLL_THUMBTRACK, lambda _e: setattr(self, "_seeking", True))
@@ -436,15 +508,15 @@ class VoxDesk(wx.Frame):
 
         controls.Add(wx.StaticText(tab, label="キー"), 0,
                      wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
-        flat = wx.Button(tab, label="♭", size=(34, -1))
+        flat = wx.Button(tab, label="♭", size=self.dip(34, -1))
         flat.Bind(wx.EVT_BUTTON, lambda _e: self.change_key(-1))
         controls.Add(flat, 0, wx.ALIGN_CENTER_VERTICAL)
         saved_key = int(self.cfg.get("pitch_semitones", 0))
         self.player.semitones = float(saved_key)
         self.key_label = wx.StaticText(tab, label=f"{saved_key:+d}" if saved_key else "±0",
-                                       size=(34, -1), style=wx.ALIGN_CENTER)
+                                       size=self.dip(34, -1), style=wx.ALIGN_CENTER)
         controls.Add(self.key_label, 0, wx.ALIGN_CENTER_VERTICAL)
-        sharp = wx.Button(tab, label="♯", size=(34, -1))
+        sharp = wx.Button(tab, label="♯", size=self.dip(34, -1))
         sharp.Bind(wx.EVT_BUTTON, lambda _e: self.change_key(1))
         controls.Add(sharp, 0, wx.ALIGN_CENTER_VERTICAL)
 
@@ -452,7 +524,7 @@ class VoxDesk(wx.Frame):
                      wx.ALIGN_CENTER_VERTICAL | wx.LEFT | wx.RIGHT, 8)
         self.music_volume = FloatSlider(tab, 0.0, 1.5,
                                         float(self.cfg.get("music_volume", 0.8)),
-                                        size=(110, -1))
+                                        size=self.dip(110, -1))
         self.music_volume.Bind(wx.EVT_SLIDER, self._on_music_volume)
         controls.Add(self.music_volume, 0, wx.ALIGN_CENTER_VERTICAL)
         self.player.volume = self.music_volume.GetFloat()
@@ -747,7 +819,7 @@ class VoxDesk(wx.Frame):
             os.path.basename(self.current_local_path or ""))
         guess = " ".join(lyrics.clean_title(title)).strip()
 
-        dialog = wx.Dialog(self, title="歌詞を探す", size=(560, 420))
+        dialog = wx.Dialog(self, title="歌詞を探す", size=self.dip(560, 420))
         sizer = wx.BoxSizer(wx.VERTICAL)
         row = wx.BoxSizer(wx.HORIZONTAL)
         query = wx.TextCtrl(dialog, value=guess, style=wx.TE_PROCESS_ENTER)
@@ -759,7 +831,7 @@ class VoxDesk(wx.Frame):
         listing = wx.ListCtrl(dialog, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
         for index, (text, width) in enumerate((("曲名", 200), ("アーティスト", 150),
                                                ("長さ", 60), ("時刻", 60))):
-            listing.InsertColumn(index, text, width=width)
+            listing.InsertColumn(index, text, width=self.FromDIP(width))
         sizer.Add(listing, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
 
         buttons = wx.StdDialogButtonSizer()
@@ -809,7 +881,7 @@ class VoxDesk(wx.Frame):
         """カラオケの人気曲一覧を出して、選んだ曲を検索欄へ入れる。"""
         import ranking
 
-        dialog = wx.Dialog(self, title="カラオケ ランキング", size=(620, 520))
+        dialog = wx.Dialog(self, title="カラオケ ランキング", size=self.dip(620, 520))
         sizer = wx.BoxSizer(wx.VERTICAL)
         head = wx.BoxSizer(wx.HORIZONTAL)
         head.Add(wx.StaticText(dialog, label="種類"), 0, wx.ALIGN_CENTER_VERTICAL)
@@ -824,7 +896,7 @@ class VoxDesk(wx.Frame):
         listing = wx.ListCtrl(dialog, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
         for index, (text, width) in enumerate((("順位", 50), ("曲名", 280),
                                                ("アーティスト", 220))):
-            listing.InsertColumn(index, text, width=width)
+            listing.InsertColumn(index, text, width=self.FromDIP(width))
         sizer.Add(listing, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
 
         buttons = wx.StdDialogButtonSizer()
@@ -886,7 +958,7 @@ class VoxDesk(wx.Frame):
         self.mic_combo = wx.ComboBox(parent, style=wx.CB_READONLY)
         self.mic_combo.Bind(wx.EVT_COMBOBOX, lambda _e: self._on_device_change())
         grid.Add(self.mic_combo, 1, wx.EXPAND)
-        mic_test = wx.Button(parent, label="テスト", size=(70, -1))
+        mic_test = wx.Button(parent, label="テスト", size=self.dip(70, -1))
         mic_test.Bind(wx.EVT_BUTTON, lambda _e: self.test_device("input"))
         grid.Add(mic_test, 0)
 
@@ -894,7 +966,7 @@ class VoxDesk(wx.Frame):
         self.out_combo = wx.ComboBox(parent, style=wx.CB_READONLY)
         self.out_combo.Bind(wx.EVT_COMBOBOX, lambda _e: self._on_device_change())
         grid.Add(self.out_combo, 1, wx.EXPAND)
-        out_test = wx.Button(parent, label="テスト", size=(70, -1))
+        out_test = wx.Button(parent, label="テスト", size=self.dip(70, -1))
         out_test.Bind(wx.EVT_BUTTON, lambda _e: self.test_device("output"))
         grid.Add(out_test, 0)
 
@@ -910,7 +982,8 @@ class VoxDesk(wx.Frame):
         sizer.Add(box, 0, wx.EXPAND | wx.ALL, 8)
 
         action = wx.BoxSizer(wx.HORIZONTAL)
-        self.mic_button = wx.Button(tab, label="🎤 マイクを入れる", size=(170, 34))
+        self.mic_button = wx.Button(tab, label="🎤 マイクを入れる", size=self.dip(190, 38))
+        emphasize(self.mic_button)
         self.mic_button.Bind(wx.EVT_BUTTON, lambda _e: self.toggle_mic())
         action.Add(self.mic_button, 0)
         action.AddStretchSpacer()
@@ -930,7 +1003,7 @@ class VoxDesk(wx.Frame):
                                       float(self.cfg.get("mic_volume", 1.0)))
         self.mic_volume.Bind(wx.EVT_SLIDER, lambda _e: self._on_mic_volume())
         row.Add(self.mic_volume, 1, wx.ALIGN_CENTER_VERTICAL)
-        self.mic_volume_label = wx.StaticText(parent, label="100%", size=(56, -1))
+        self.mic_volume_label = wx.StaticText(parent, label="100%", size=self.dip(56, -1))
         row.Add(self.mic_volume_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 6)
         box.Add(row, 0, wx.EXPAND | wx.ALL, 6)
         sizer.Add(box, 0, wx.EXPAND | wx.ALL, 8)
@@ -942,12 +1015,12 @@ class VoxDesk(wx.Frame):
         meters.Add(wx.StaticText(parent, label="入力"), 0, wx.ALIGN_CENTER_VERTICAL)
         self.in_meter = wx.Gauge(parent, range=100)
         meters.Add(self.in_meter, 1, wx.EXPAND)
-        self.in_db_label = wx.StaticText(parent, label="--- dB", size=(70, -1))
+        self.in_db_label = wx.StaticText(parent, label="--- dB", size=self.dip(70, -1))
         meters.Add(self.in_db_label, 0, wx.ALIGN_CENTER_VERTICAL)
         meters.Add(wx.StaticText(parent, label="出力"), 0, wx.ALIGN_CENTER_VERTICAL)
         self.out_meter = wx.Gauge(parent, range=100)
         meters.Add(self.out_meter, 1, wx.EXPAND)
-        self.out_db_label = wx.StaticText(parent, label="--- dB", size=(70, -1))
+        self.out_db_label = wx.StaticText(parent, label="--- dB", size=self.dip(70, -1))
         meters.Add(self.out_db_label, 0, wx.ALIGN_CENTER_VERTICAL)
         box.Add(meters, 0, wx.EXPAND | wx.ALL, 6)
         self.quality_label = hint_label(parent)
@@ -965,7 +1038,7 @@ class VoxDesk(wx.Frame):
         top.Add(wx.StaticText(parent, label="ノイズ除去"), 0,
                 wx.ALIGN_CENTER_VERTICAL | wx.LEFT | wx.RIGHT, 8)
         self.denoise_mode = wx.ComboBox(parent, choices=list(DENOISE_MODES),
-                                        style=wx.CB_READONLY, size=(230, -1))
+                                        style=wx.CB_READONLY, size=self.dip(230, -1))
         self.denoise_mode.SetValue(self.cfg["effects"].get("denoise_mode", "標準"))
         self.denoise_mode.Bind(wx.EVT_COMBOBOX, lambda _e: self.apply_denoise_mode())
         top.Add(self.denoise_mode, 0, wx.ALIGN_CENTER_VERTICAL)
@@ -985,7 +1058,7 @@ class VoxDesk(wx.Frame):
             slider.Bind(wx.EVT_SLIDER, lambda _e, k=key: self._on_fx_change(k))
             self.fx_sliders[key] = slider
             grid.Add(slider, 1, wx.EXPAND)
-            value_label = wx.StaticText(parent, label="", size=(70, -1))
+            value_label = wx.StaticText(parent, label="", size=self.dip(70, -1))
             self.fx_labels[key] = (value_label, unit)
             grid.Add(value_label, 0, wx.ALIGN_CENTER_VERTICAL)
         box.Add(grid, 0, wx.EXPAND | wx.ALL, 6)
@@ -1415,9 +1488,9 @@ class VoxDesk(wx.Frame):
 
         box, parent = boxed(tab, " 挿しているもの ")
         self.vst_list = wx.ListCtrl(parent, style=wx.LC_REPORT | wx.LC_SINGLE_SEL,
-                                    size=(280, -1))
-        self.vst_list.InsertColumn(0, "名前", width=190)
-        self.vst_list.InsertColumn(1, "状態", width=80)
+                                    size=self.dip(280, -1))
+        self.vst_list.InsertColumn(0, "名前", width=self.FromDIP(190))
+        self.vst_list.InsertColumn(1, "状態", width=self.FromDIP(80))
         self.vst_list.Bind(wx.EVT_LIST_ITEM_SELECTED,
                            lambda _e: self._show_vst_parameters())
         self.vst_list.Bind(wx.EVT_LIST_ITEM_ACTIVATED, lambda _e: self.open_vst_editor())
@@ -1427,11 +1500,13 @@ class VoxDesk(wx.Frame):
                                       ("▼", lambda: self.move_vst(1), 36),
                                       ("バイパス", self.toggle_vst_bypass, 80),
                                       ("外す", self.remove_vst, 60)):
-            button = wx.Button(parent, label=label, size=(width, -1))
+            button = wx.Button(parent, label=label, size=self.dip(width, -1))
             button.Bind(wx.EVT_BUTTON, lambda _e, h=handler: h())
             buttons.Add(button, 0, wx.RIGHT, 3)
         box.Add(buttons, 0, wx.ALL, 4)
-        self.editor_button = wx.Button(parent, label="プラグインの画面を開く")
+        self.editor_button = wx.Button(parent, label="プラグインの画面を開く",
+                                       size=self.dip(-1, 34))
+        emphasize(self.editor_button, 0)
         self.editor_button.Bind(wx.EVT_BUTTON, lambda _e: self.open_vst_editor())
         box.Add(self.editor_button, 0, wx.EXPAND | wx.ALL, 4)
         note = hint_label(parent, "※ 画面は別ウィンドウで開きます。開いている間も"
@@ -1449,7 +1524,7 @@ class VoxDesk(wx.Frame):
         head.Add(self.param_filter, 1, wx.ALIGN_CENTER_VERTICAL)
         # つまみが何十個もあるプラグインでは、全部並べると出るまでに間が空く。
         # よく使う分だけ先に出して、残りは求められたときに出す
-        self.param_more = wx.Button(parent, label="すべて表示", size=(100, -1))
+        self.param_more = wx.Button(parent, label="すべて表示", size=self.dip(100, -1))
         self.param_more.Bind(wx.EVT_BUTTON, lambda _e: self._show_all_params())
         head.Add(self.param_more, 0, wx.LEFT, 6)
         self.param_more.Hide()
@@ -1784,7 +1859,7 @@ class VoxDesk(wx.Frame):
     def _build_param_row(self, slot, info: dict, sizer) -> None:
         area = self.param_area
         key, param = info["key"], info["param"]
-        sizer.Add(wx.StaticText(area, label=key.replace("_", " "), size=(150, -1)), 0,
+        sizer.Add(wx.StaticText(area, label=key.replace("_", " "), size=self.dip(150, -1)), 0,
                   wx.ALIGN_CENTER_VERTICAL)
         entry = {"key": key, "param": param, "slot": slot, "kind": "",
                  "widget": None, "label": None}
@@ -1826,7 +1901,7 @@ class VoxDesk(wx.Frame):
 
         entry["widget"] = widget
         sizer.Add(widget, 1, wx.EXPAND)
-        value_label = wx.StaticText(area, label=info["text"], size=(90, -1))
+        value_label = wx.StaticText(area, label=info["text"], size=self.dip(90, -1))
         entry["label"] = value_label
         sizer.Add(value_label, 0, wx.ALIGN_CENTER_VERTICAL)
         self._param_rows.append(entry)
@@ -1946,7 +2021,7 @@ class VoxDesk(wx.Frame):
                                          float(self.cfg.get("buffer_ms", 40.0)))
         self.buffer_slider.Bind(wx.EVT_SLIDER, lambda _e: self._on_buffer_change())
         grid.Add(self.buffer_slider, 1, wx.EXPAND)
-        self.buffer_label = wx.StaticText(parent, label="", size=(70, -1))
+        self.buffer_label = wx.StaticText(parent, label="", size=self.dip(70, -1))
         grid.Add(self.buffer_label, 0, wx.ALIGN_CENTER_VERTICAL)
         box.Add(grid, 0, wx.EXPAND | wx.ALL, 6)
         box.Add(hint_label(parent, "音が途切れるときは右へ。声の遅れは少し増えます"),
@@ -1970,7 +2045,7 @@ class VoxDesk(wx.Frame):
         sizer.Add(box, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 8)
 
         diag = wx.BoxSizer(wx.HORIZONTAL)
-        diag.Add(wx.StaticText(tab, label="機器の状態"), 0,
+        diag.Add(head_label(tab, "機器の状態"), 0,
                  wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8)
         self.diag_button = wx.Button(tab, label="すべて調べる")
         self.diag_button.Bind(wx.EVT_BUTTON, lambda _e: self.run_diagnostics())
@@ -1985,7 +2060,9 @@ class VoxDesk(wx.Frame):
         self.diag_list = wx.ListCtrl(tab, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
         for index, (text, width) in enumerate((("種類", 60), ("デバイス", 330),
                                                ("結果", 260), ("OS 側の設定", 260))):
-            self.diag_list.InsertColumn(index, text, width=width)
+            self.diag_list.InsertColumn(index, text, width=self.FromDIP(width))
+        self.diag_list.Bind(wx.EVT_SIZE,
+                            lambda e: (stretch_column(self.diag_list, 3), e.Skip()))
         sizer.Add(self.diag_list, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 8)
 
         box, parent = boxed(tab, " AI ボーカル除去 ")
