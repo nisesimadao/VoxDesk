@@ -1,0 +1,391 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#101014">
+<title>VoxDesk リモコン</title>
+<style>
+:root {
+  --bg: #101014; --panel: #1b1b22; --line: #2c2c36;
+  --text: #f2f2f5; --dim: #9a9aa8; --accent: #ff5a7a; --ok: #4ad3a0;
+}
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Noto Sans JP", sans-serif;
+  padding-bottom: env(safe-area-inset-bottom);
+}
+header {
+  padding: 10px 14px; border-bottom: 1px solid var(--line);
+  display: flex; align-items: center; gap: 10px; position: sticky; top: 0;
+  background: var(--bg); z-index: 5;
+}
+header h1 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: .04em; }
+#link { margin-left: auto; font-size: 12px; color: var(--dim); }
+#link.on { color: var(--ok); }
+
+.stage { background: #000; position: relative; }
+.stage video, .stage img { width: 100%; display: block; max-height: 42vh; object-fit: contain; }
+.stage .empty {
+  padding: 34px 12px; text-align: center; color: var(--dim); font-size: 13px;
+}
+.lyric {
+  padding: 12px 14px; min-height: 62px; border-bottom: 1px solid var(--line);
+}
+.lyric .now { font-size: 19px; font-weight: 700; line-height: 1.35; }
+.lyric .next { font-size: 14px; color: var(--dim); margin-top: 4px; }
+
+.now-playing { padding: 10px 14px; border-bottom: 1px solid var(--line); }
+.now-playing .title {
+  font-size: 14px; font-weight: 600; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap;
+}
+.now-playing .time { font-size: 12px; color: var(--dim); margin-top: 2px; }
+input[type=range] { width: 100%; accent-color: var(--accent); }
+
+.controls { display: flex; gap: 8px; padding: 10px 14px; align-items: center; }
+button {
+  font: inherit; color: var(--text); background: var(--panel);
+  border: 1px solid var(--line); border-radius: 10px; padding: 11px 14px;
+  cursor: pointer; min-height: 44px;
+}
+button:active { background: #2a2a34; }
+button.main { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 700; flex: 1; }
+button.small { padding: 8px 10px; min-height: 38px; font-size: 13px; }
+
+.row { display: flex; gap: 8px; align-items: center; padding: 6px 14px; }
+.row .label { font-size: 12px; color: var(--dim); width: 44px; flex: none; }
+.key-value { min-width: 34px; text-align: center; font-weight: 700; }
+
+nav { display: flex; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+nav button {
+  flex: 1; border: none; border-radius: 0; background: transparent;
+  color: var(--dim); padding: 12px 0; font-size: 13px;
+}
+nav button.active { color: var(--text); box-shadow: inset 0 -2px 0 var(--accent); }
+
+section { display: none; padding: 10px 14px 24px; }
+section.active { display: block; }
+.search-bar { display: flex; gap: 8px; margin-bottom: 10px; }
+.search-bar input {
+  flex: 1; font: inherit; padding: 11px 12px; border-radius: 10px;
+  border: 1px solid var(--line); background: var(--panel); color: var(--text);
+}
+ul { list-style: none; margin: 0; padding: 0; }
+li {
+  padding: 11px 0; border-bottom: 1px solid var(--line);
+  display: flex; gap: 10px; align-items: center;
+}
+li .info { flex: 1; min-width: 0; }
+li .name { font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+li .sub { font-size: 12px; color: var(--dim); margin-top: 2px;
+          overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+li .badge { color: var(--ok); font-size: 11px; border: 1px solid var(--ok);
+            border-radius: 4px; padding: 0 4px; margin-left: 6px; }
+li .rank { width: 26px; text-align: right; color: var(--dim); font-size: 13px; flex: none; }
+.hint { color: var(--dim); font-size: 13px; padding: 14px 0; text-align: center; }
+select {
+  font: inherit; background: var(--panel); color: var(--text);
+  border: 1px solid var(--line); border-radius: 10px; padding: 10px; width: 100%;
+  margin-bottom: 10px;
+}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>VoxDesk リモコン</h1>
+  <span id="link">つないでいます…</span>
+</header>
+
+<div class="stage" id="stage">
+  <div class="empty" id="stage-empty">映像はここに出ます</div>
+</div>
+
+<div class="lyric">
+  <div class="now" id="lyric-now">—</div>
+  <div class="next" id="lyric-next"></div>
+</div>
+
+<div class="now-playing">
+  <div class="title" id="title">曲を予約してください</div>
+  <div class="time" id="time">0:00 / 0:00</div>
+  <input type="range" id="seek" min="0" max="1000" value="0">
+</div>
+
+<div class="controls">
+  <button class="main" id="play">▶ 再生</button>
+  <button id="next">⏭ 次の曲</button>
+  <button id="stop">■ 停止</button>
+</div>
+
+<div class="row">
+  <span class="label">キー</span>
+  <button class="small" id="key-down">♭</button>
+  <span class="key-value" id="key">±0</span>
+  <button class="small" id="key-up">♯</button>
+  <span class="label" style="margin-left:10px">伴奏</span>
+  <input type="range" id="volume" min="0" max="150" value="80">
+</div>
+
+<nav>
+  <button data-tab="search" class="active">検索</button>
+  <button data-tab="ranking">ランキング</button>
+  <button data-tab="queue">予約 <span id="queue-count"></span></button>
+</nav>
+
+<section id="tab-search" class="active">
+  <div class="search-bar">
+    <input id="q" type="search" placeholder="曲名・アーティスト名" enterkeyhint="search">
+    <button id="go">検索</button>
+  </div>
+  <ul id="results"></ul>
+  <div class="hint" id="search-hint">歌いたい曲を探して「予約」を押してください。</div>
+</section>
+
+<section id="tab-ranking">
+  <select id="ranking-source"></select>
+  <ul id="ranking-list"></ul>
+  <div class="hint" id="ranking-hint">読み込んでいます…</div>
+</section>
+
+<section id="tab-queue">
+  <ul id="queue-list"></ul>
+  <div class="hint" id="queue-hint">まだ予約はありません。</div>
+</section>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let state = {};
+let seeking = false;
+let videoKind = "none";
+
+function timeText(seconds) {
+  seconds = Math.max(0, Math.floor(seconds || 0));
+  return Math.floor(seconds / 60) + ":" + String(seconds % 60).padStart(2, "0");
+}
+
+async function post(path, body) {
+  const res = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body || {}),
+  });
+  return res.json();
+}
+
+function control(action, value) { return post("/control", { action, value }); }
+
+// ---- 映像 ----
+// 手元にファイルがあるときはブラウザに直接デコードさせる（PC 側の負担が無い）。
+// 配信をそのまま鳴らしている場合はそれができないので、送られてくる絵を貼る。
+function updateStage(kind) {
+  if (kind === videoKind) return;
+  videoKind = kind;
+  const stage = $("stage");
+  stage.innerHTML = "";
+  if (kind === "file") {
+    const video = document.createElement("video");
+    video.id = "video";
+    video.src = "/video.mp4?t=" + Date.now();
+    video.muted = true;       // 音は PC のスピーカーから出す
+    video.playsInline = true;
+    video.autoplay = true;
+    stage.appendChild(video);
+  } else if (kind === "mjpeg") {
+    const img = document.createElement("img");
+    img.src = "/video.mjpeg?t=" + Date.now();
+    stage.appendChild(img);
+  } else {
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    empty.textContent = "映像はここに出ます";
+    stage.appendChild(empty);
+  }
+}
+
+// PC 側の再生位置に合わせる。ずれたときだけ直す（毎回触ると絵が飛ぶ）
+function syncVideo(position, playing) {
+  const video = $("video");
+  if (!video) return;
+  if (Math.abs(video.currentTime - position) > 1.0) video.currentTime = position;
+  if (playing && video.paused) video.play().catch(() => {});
+  if (!playing && !video.paused) video.pause();
+}
+
+function render(next) {
+  state = next;
+  updateStage(state.video);
+  const playing = state.state === "playing";
+  $("play").textContent = playing ? "⏸ 一時停止" : "▶ 再生";
+  $("title").textContent = state.title || "曲を予約してください";
+  $("time").textContent = timeText(state.position) + " / " + timeText(state.duration);
+  if (!seeking && state.duration) {
+    $("seek").value = Math.min(1000, (state.position / state.duration) * 1000);
+  }
+  $("key").textContent = state.key ? (state.key > 0 ? "+" : "") + state.key : "±0";
+  $("lyric-now").textContent = state.lyric || "—";
+  $("lyric-next").textContent = state.lyric_next || "";
+  syncVideo(state.position, playing);
+  renderQueue(state.queue || []);
+}
+
+function renderQueue(queue) {
+  $("queue-count").textContent = queue.length ? "(" + queue.length + ")" : "";
+  const list = $("queue-list");
+  list.innerHTML = "";
+  $("queue-hint").style.display = queue.length ? "none" : "block";
+  queue.forEach((entry, index) => {
+    const li = document.createElement("li");
+    const info = document.createElement("div");
+    info.className = "info";
+    const name = document.createElement("div");
+    name.className = "name";
+    name.textContent = entry.title;
+    info.appendChild(name);
+    const remove = document.createElement("button");
+    remove.className = "small";
+    remove.textContent = "取消";
+    remove.onclick = () => post("/unqueue", { index });
+    li.appendChild(info);
+    li.appendChild(remove);
+    list.appendChild(li);
+  });
+}
+
+function songRow(song, onQueue, rank) {
+  const li = document.createElement("li");
+  if (rank !== undefined) {
+    const badge = document.createElement("div");
+    badge.className = "rank";
+    badge.textContent = rank;
+    li.appendChild(badge);
+  }
+  const info = document.createElement("div");
+  info.className = "info";
+  const name = document.createElement("div");
+  name.className = "name";
+  name.textContent = song.title;
+  if (song.trusted) {
+    const mark = document.createElement("span");
+    mark.className = "badge";
+    mark.textContent = "定番";
+    name.appendChild(mark);
+  }
+  const sub = document.createElement("div");
+  sub.className = "sub";
+  sub.textContent = [song.uploader || song.artist, song.duration].filter(Boolean).join(" · ");
+  info.appendChild(name);
+  info.appendChild(sub);
+  const button = document.createElement("button");
+  button.className = "small";
+  button.textContent = rank === undefined ? "予約" : "検索";
+  button.onclick = () => onQueue(button);
+  li.appendChild(info);
+  li.appendChild(button);
+  return li;
+}
+
+// ---- 検索 ----
+async function search(query) {
+  $("search-hint").textContent = "探しています…";
+  $("search-hint").style.display = "block";
+  $("results").innerHTML = "";
+  try {
+    const data = await post("/search", { query });
+    const list = $("results");
+    (data.songs || []).forEach((song) => {
+      list.appendChild(songRow(song, async (button) => {
+        button.textContent = "…";
+        const result = await post("/queue", { id: song.id, title: song.title });
+        button.textContent = result.started ? "再生中" : "予約済";
+        button.disabled = true;
+      }));
+    });
+    $("search-hint").style.display = data.songs && data.songs.length ? "none" : "block";
+    if (!data.songs || !data.songs.length) $("search-hint").textContent = "見つかりませんでした。";
+  } catch (e) {
+    $("search-hint").textContent = "検索できませんでした。";
+  }
+}
+
+$("go").onclick = () => search($("q").value.trim());
+$("q").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); $("q").blur(); search($("q").value.trim()); }
+});
+
+// ---- ランキング ----
+async function loadRanking(source) {
+  $("ranking-hint").textContent = "読み込んでいます…";
+  $("ranking-hint").style.display = "block";
+  $("ranking-list").innerHTML = "";
+  try {
+    const url = "/ranking" + (source ? "?source=" + encodeURIComponent(source) : "");
+    const data = await fetch(url).then((r) => r.json());
+    const picker = $("ranking-source");
+    if (!picker.options.length) {
+      (data.sources || []).forEach((name) => {
+        const option = document.createElement("option");
+        option.value = option.textContent = name;
+        picker.appendChild(option);
+      });
+    }
+    const list = $("ranking-list");
+    (data.songs || []).forEach((song) => {
+      list.appendChild(songRow(song, () => {
+        $("q").value = song.query;
+        document.querySelector('nav button[data-tab="search"]').click();
+        search(song.query);
+      }, song.rank));
+    });
+    $("ranking-hint").style.display = data.songs && data.songs.length ? "none" : "block";
+    if (!data.songs || !data.songs.length) $("ranking-hint").textContent = "読み込めませんでした。";
+  } catch (e) {
+    $("ranking-hint").textContent = "読み込めませんでした。";
+  }
+}
+$("ranking-source").onchange = (e) => loadRanking(e.target.value);
+
+// ---- 操作 ----
+$("play").onclick = () => control("play_pause");
+$("next").onclick = () => control("next");
+$("stop").onclick = () => control("stop");
+$("key-down").onclick = () => control("key", (state.key || 0) - 1);
+$("key-up").onclick = () => control("key", (state.key || 0) + 1);
+$("volume").addEventListener("change", (e) => control("volume", e.target.value / 100));
+$("seek").addEventListener("pointerdown", () => { seeking = true; });
+$("seek").addEventListener("change", (e) => {
+  seeking = false;
+  control("seek", e.target.value / 1000);
+});
+
+document.querySelectorAll("nav button").forEach((button) => {
+  button.onclick = () => {
+    document.querySelectorAll("nav button").forEach((b) => b.classList.remove("active"));
+    document.querySelectorAll("section").forEach((s) => s.classList.remove("active"));
+    button.classList.add("active");
+    $("tab-" + button.dataset.tab).classList.add("active");
+    if (button.dataset.tab === "ranking" && !$("ranking-list").children.length) loadRanking();
+  };
+});
+
+// ---- PC からの通知を受け続ける ----
+function listen() {
+  const source = new EventSource("/events");
+  source.onmessage = (event) => {
+    $("link").textContent = "つながっています";
+    $("link").className = "on";
+    render(JSON.parse(event.data));
+  };
+  source.onerror = () => {
+    $("link").textContent = "切れました。つなぎ直しています…";
+    $("link").className = "";
+    source.close();
+    setTimeout(listen, 2000);
+  };
+}
+listen();
+</script>
+</body>
+</html>

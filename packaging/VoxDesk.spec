@@ -34,10 +34,12 @@ hiddenimports += [
     "vst_editor_host", "sounddevice", "applog", "config", "comutil", "devices",
     "lyrics", "mic_chain", "model_installer", "music_search", "pitch_render",
     "platform_support", "player", "ranking", "router", "separator",
+    "juce_thread", "webserver",
 ]
 
-# アイコン
-datas += [(os.path.join(ROOT, "assets"), "assets")]
+# アイコンと、スマホ用リモコンの画面
+datas += [(os.path.join(ROOT, "assets"), "assets"),
+          (os.path.join(ROOT, "web"), "web")]
 if sys.platform == "win32":
     icon = os.path.join(ROOT, "assets", "icon.ico")
 else:

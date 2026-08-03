@@ -187,6 +187,8 @@ class KaraokeApp(tk.Tk):
         self.current_track: music_search.Track | None = None
         self.current_local_path: str | None = None  # ローカル再生中のファイル
         self.current_lyrics = None
+        self.remote = None      # スマホからのリモコン（設定で入にしたときだけ動く）
+        self.last_frame = None  # いま出している映像。リモコンへ転送するのに使う
         self.separator_capability = None
         self.editors: dict[int, dict] = {}  # 開いているプラグイン画面（別プロセス）
         self._photo: ImageTk.PhotoImage | None = None
@@ -537,7 +539,7 @@ class KaraokeApp(tk.Tk):
     def _build_setup_tab(self) -> None:
         tab = self.setup_tab
         tab.columnconfigure(0, weight=1)
-        tab.rowconfigure(2, weight=1)
+        tab.rowconfigure(3, weight=1)
 
         audio = ttk.LabelFrame(tab, text=" オーディオ ", padding=10)
         audio.grid(row=0, column=0, sticky="ew")
@@ -577,8 +579,25 @@ class KaraokeApp(tk.Tk):
         ttk.Label(audio, text="音が途切れるときは右へ。声の遅れは少し増えます",
                   style="Hint.TLabel").grid(row=4, column=1, sticky="w", padx=8)
 
+        remote = ttk.LabelFrame(tab, text=" スマホから操作する ", padding=10)
+        remote.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        remote.columnconfigure(1, weight=1)
+        self.remote_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(remote, text="リモコンを使う", variable=self.remote_var,
+                        command=self._toggle_remote).grid(row=0, column=0, sticky="w")
+        self.remote_url = ttk.Entry(remote, state="readonly", width=34)
+        self.remote_url.grid(row=0, column=1, sticky="ew", padx=8)
+        self.remote_copy = ttk.Button(remote, text="控える", width=8,
+                                      command=self._copy_remote_url, state="disabled")
+        self.remote_copy.grid(row=0, column=2)
+        ttk.Label(remote,
+                  text="同じ Wi-Fi のスマホでこの住所を開くと、曲の予約・キー・歌詞・映像が手元で使えます"
+                       "（開いている間は、同じ回線の人なら誰でも操作できます）",
+                  style="Hint.TLabel", wraplength=560, justify="left").grid(
+            row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
         diag = ttk.Frame(tab)
-        diag.grid(row=1, column=0, sticky="ew", pady=(12, 4))
+        diag.grid(row=2, column=0, sticky="ew", pady=(12, 4))
         ttk.Label(diag, text="機器の状態", style="Head.TLabel").pack(side="left")
         self.diag_button = ttk.Button(diag, text="すべて調べる",
                                       command=self.run_diagnostics)
@@ -593,10 +612,10 @@ class KaraokeApp(tk.Tk):
                                  ("result", "結果", 260), ("hint", "OS 側の設定", 260)):
             self.diag_tree.heading(col, text=text)
             self.diag_tree.column(col, width=width, anchor="w")
-        self.diag_tree.grid(row=2, column=0, sticky="nsew")
+        self.diag_tree.grid(row=3, column=0, sticky="nsew")
 
         vocal = ttk.LabelFrame(tab, text=" AI ボーカル除去 ", padding=10)
-        vocal.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        vocal.grid(row=4, column=0, sticky="ew", pady=(10, 0))
         vocal.columnconfigure(0, weight=1)
         self.vocal_setup_label = ttk.Label(vocal, text="確認中…", style="Hint.TLabel",
                                            wraplength=700)
@@ -608,7 +627,7 @@ class KaraokeApp(tk.Tk):
         self.vocal_progress.grid_remove()  # 取得中だけ出す
 
         storage = ttk.Frame(tab)
-        storage.grid(row=4, column=0, sticky="ew", pady=(10, 0))
+        storage.grid(row=5, column=0, sticky="ew", pady=(10, 0))
         self.cache_label = ttk.Label(storage, text="作成したオフボーカル: 確認中…",
                                      style="Hint.TLabel")
         self.cache_label.pack(side="left")
@@ -617,7 +636,7 @@ class KaraokeApp(tk.Tk):
         self.after(1200, self._update_cache_label)
 
         ttk.Label(tab, text=f"設定の保存先: {config.CONFIG_PATH}", style="Hint.TLabel").grid(
-            row=5, column=0, sticky="w", pady=(6, 0))
+            row=6, column=0, sticky="w", pady=(6, 0))
 
     # ---------- VST3 タブ ----------
     def _build_vst_tab(self) -> None:
@@ -917,6 +936,48 @@ class KaraokeApp(tk.Tk):
                      if str(self.diag_tree.item(row)["values"][2]).startswith("○"))
         self.status_label.configure(
             text=f"確認おわり: {len(rows)}/{total} 台を調べて {usable} 台が使えます")
+
+    # ---------- スマホからのリモコン ----------
+    def _toggle_remote(self) -> None:
+        """リモコン用のサーバを入切する。
+
+        既定では止めてある。開けている間は同じ回線の人が誰でも操作できる
+        ので、使う人が自分で選んだときだけ開く。
+        """
+        if self.remote_var.get():
+            try:
+                if self.remote is None:
+                    import webserver
+                    self.remote = webserver.RemoteServer(self)
+                url = self.remote.start()
+            except Exception as e:
+                self.remote_var.set(False)
+                LOG.error("リモコンを開けませんでした", exc_info=e)
+                messagebox.showerror(APP_TITLE, f"リモコンを開けませんでした:\n{e}")
+                return
+            self._set_remote_url(url)
+            self.remote_copy.configure(state="normal")
+            self.status_label.configure(text=f"リモコンを開きました: {url}")
+        else:
+            if self.remote is not None:
+                self.remote.stop()
+            self._set_remote_url("")
+            self.remote_copy.configure(state="disabled")
+            self.status_label.configure(text="リモコンを閉じました")
+
+    def _set_remote_url(self, url: str) -> None:
+        self.remote_url.configure(state="normal")
+        self.remote_url.delete(0, "end")
+        self.remote_url.insert(0, url)
+        self.remote_url.configure(state="readonly")
+
+    def _copy_remote_url(self) -> None:
+        url = self.remote_url.get()
+        if not url:
+            return
+        self.clipboard_clear()
+        self.clipboard_append(url)
+        self.status_label.configure(text="住所を控えました（スマホのブラウザに貼り付けてください）")
 
     def use_diagnosed_device(self) -> None:
         """診断の表で選んだ機器を、そのまま設定に反映する。
@@ -2482,6 +2543,7 @@ class KaraokeApp(tk.Tk):
         self.player.stop(wait=False)
         self.video_label.configure(image="", text="ここに映像が出ます")
         self._photo = None
+        self.last_frame = None
         self.position_var.set(0)
         self.time_label.configure(text="--:-- / --:--")
         self.music_status.configure(text=message)
@@ -2561,6 +2623,7 @@ class KaraokeApp(tk.Tk):
         #（作り直しは何倍も重く、GUI 全体が固まる原因になる）
         image = self.player.take_frame()
         if image is not None:
+            self.last_frame = image  # リモコンへ流す用（貼り替えでは変化しない）
             if self._photo is None or self._photo.width() != image.width or \
                     self._photo.height() != image.height:
                 # 表示中の画像をその場で捨てると、描画途中の Tk が
@@ -2589,6 +2652,8 @@ class KaraokeApp(tk.Tk):
             self._update_lyric_display()
             if self.player.finished:
                 self.stop_music("再生が終わりました")
+                if self.remote is not None:  # 予約が入っていれば次の曲へ
+                    self.remote.song_finished()
 
         self.after(33, self._tick)
 
@@ -2602,6 +2667,8 @@ class KaraokeApp(tk.Tk):
         self.cfg["vst3"] = self.chain.vst_state()
         config.save(self.cfg)
         self.close_vst_editor()  # 開いたままのプラグイン画面を残さない
+        if self.remote is not None:
+            self.remote.stop()
         self.player.stop(wait=False)
         self.router.stop()
         applog.closing()
