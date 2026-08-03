@@ -57,7 +57,17 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libportaudio2 python3-tk
+          sudo apt-get install -y libportaudio2 libgtk-3-0 libnotify4 libsdl2-2.0-0
+
+      - name: Linux 向けの wxPython を入れる
+        if: runner.os == 'Linux'
+        # PyPI には Linux 用の出来合いが無く、そのまま入れようとすると
+        # wxWidgets を丸ごと組み立てにいって失敗する。本家が用意している
+        # ディストリ別の置き場から取る。
+        run: |
+          pip install --upgrade pip
+          pip install -f https://extras.wxpython.org/wxPython4/extras/linux/gtk3/ubuntu-22.04 \
+                      "wxPython==4.2.2"
 
       - name: Python の依存を入れる
         run: |
