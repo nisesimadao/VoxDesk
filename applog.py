@@ -21,6 +21,10 @@ MAX_BYTES = 1_000_000
 
 _ready = False
 _crash_file = None
+# 判定などの短命な子プロセスが本体と同じ「起動」の印を書くと、終了の印が
+# 無いまま次の起動が来るので、落ちたように見えてしまう。役割が分かるものは
+# 別の印にする。読み込みの時点で決まっていないと手遅れなので、引数から拾う。
+ROLE = "判定" if "--capability" in sys.argv else ""
 
 
 def setup() -> str:
@@ -58,7 +62,10 @@ def setup() -> str:
 
     _ready = True
     _install_handlers()
-    logging.getLogger("voxdesk").info("===== 起動 pid=%s =====", os.getpid())
+    if ROLE:
+        logging.getLogger("voxdesk").info("----- %s pid=%s -----", ROLE, os.getpid())
+    else:
+        logging.getLogger("voxdesk").info("===== 起動 pid=%s =====", os.getpid())
     return LOG_PATH
 
 
