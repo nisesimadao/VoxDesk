@@ -175,7 +175,20 @@ async function post(path, body) {
   return res.json();
 }
 
-function control(action, value) { return post("/control", { action, value }); }
+let noticeTimer = null;
+
+function notice(text) {
+  const link = $("link");
+  link.textContent = text;
+  clearTimeout(noticeTimer);
+  noticeTimer = setTimeout(() => { link.textContent = "つながっています"; }, 2500);
+}
+
+async function control(action, value) {
+  const result = await post("/control", { action, value });
+  if (result && result.ok === false && result.error) notice(result.error);
+  return result;
+}
 
 // ---- 映像 ----
 // 手元にファイルがあるときはブラウザに直接デコードさせる（PC 側の負担が無い）。

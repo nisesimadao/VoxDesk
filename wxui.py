@@ -73,6 +73,8 @@ def _enable_high_dpi() -> None:
 
 _enable_high_dpi()
 
+MANUAL_PRESET = "手動調整"
+
 DARK = wx.Colour(0x10, 0x10, 0x14)
 LYRIC_NOW = wx.Colour(0xF2, 0xF4, 0xF8)
 LYRIC_NEXT = wx.Colour(0x8A, 0x90, 0xA0)
@@ -167,6 +169,27 @@ class VideoView(wx.Panel):
 def hint_label(parent, text: str = "") -> wx.StaticText:
     label = wx.StaticText(parent, label=text)
     label.SetForegroundColour(wx.SystemSettings.GetColour(wx.SYS_COLOUR_GRAYTEXT))
+    return label
+
+
+def wrapped_label(parent, text: str) -> wx.StaticText:
+    """幅に合わせて折り返す説明文。
+
+    決め打ちの幅で折ると、画面の拡大率や窓の大きさによって
+    「同じ Wi-Fi」で改行されるような妙な切れ方をする。
+    """
+    label = hint_label(parent, text)
+    label._source = text
+
+    def rewrap(event):
+        width = event.GetSize().width - 12
+        if width > 80 and getattr(label, "_wrapped_at", 0) != width:
+            label._wrapped_at = width
+            label.SetLabel(label._source)
+            label.Wrap(width)
+        event.Skip()
+
+    parent.Bind(wx.EVT_SIZE, rewrap)
     return label
 
 
@@ -281,6 +304,10 @@ class VoxDesk(wx.Frame):
         self._build_mic_tab()
         self._build_vst_tab()
         self._build_setup_tab()
+        # 窓を出したあとに作った頁には「大きさが決まった」の通知が来ない。
+        # ここで並べ直さないと、部品が左上に重なったまま出る
+        for tab in (self.mic_tab, self.vst_tab, self.setup_tab):
+            tab.Layout()
         self._ready = True
         self._reload_devices()
         wx.CallLater(150, self._restore_vst)
@@ -467,11 +494,13 @@ class VoxDesk(wx.Frame):
         # 余った分はタイトルに渡す
         self.results.Bind(wx.EVT_SIZE, lambda e: (stretch_column(self.results, 2), e.Skip()))
         self.results.SetMinSize(self.dip(-1, 150))
-        sizer.Add(self.results, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 8)
+        # 一覧を固定の高さにすると、曲が 6 行ちょっとしか見えないのに
+        # 映像の黒い枠が画面の半分以上を占める。両方を伸ばして分け合う
+        sizer.Add(self.results, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 8)
 
         self.video = VideoView(tab)
         self.video.Bind(wx.EVT_LEFT_DCLICK, lambda _e: self.toggle_play())
-        sizer.Add(self.video, 1, wx.EXPAND | wx.ALL, 8)
+        sizer.Add(self.video, 2, wx.EXPAND | wx.ALL, 8)
 
         self.lyric_panel = wx.Panel(tab)
         self.lyric_panel.SetBackgroundColour(DARK)
@@ -1031,8 +1060,11 @@ class VoxDesk(wx.Frame):
         top = wx.BoxSizer(wx.HORIZONTAL)
         top.Add(wx.StaticText(parent, label="プリセット"), 0,
                 wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
-        self.preset = wx.ComboBox(parent, choices=list(PRESETS), style=wx.CB_READONLY)
-        self.preset.SetSelection(0)
+        # 保存された値がどのプリセットとも違うことがある。そのときに
+        # 先頭の名前を出すと、実際の音と表示が食い違って嘘になる
+        self.preset = wx.ComboBox(parent, choices=list(PRESETS) + [MANUAL_PRESET],
+                                  style=wx.CB_READONLY)
+        self.preset.SetValue(self._current_preset_name())
         self.preset.Bind(wx.EVT_COMBOBOX, lambda _e: self.apply_preset())
         top.Add(self.preset, 1, wx.ALIGN_CENTER_VERTICAL)
         top.Add(wx.StaticText(parent, label="ノイズ除去"), 0,
@@ -1318,6 +1350,7 @@ class VoxDesk(wx.Frame):
         if not apply_now:
             return
         self.cfg["effects"][key] = value
+        self._sync_preset_name()  # 手で動かしたらプリセット名も実態に合わせる
         if key == "input_gain_db":
             self.chain.input_gain.gain_db = value
         elif key == "denoise_strength":
@@ -1343,7 +1376,8 @@ class VoxDesk(wx.Frame):
     def apply_preset(self) -> None:
         name = self.preset.GetValue()
         preset = PRESETS.get(name)
-        if not preset:
+        if not preset:  # 「手動調整」は選んでも何も起きない
+            self._sync_preset_name()
             return
         self.cfg["effects"].update(preset)
         self.chain.enabled = name != "加工しない"
@@ -1358,6 +1392,21 @@ class VoxDesk(wx.Frame):
         for key in self.fx_sliders:  # スライダー横の数値表示を追従させる
             self._on_fx_change(key)
         self.set_status(f"プリセット「{name}」を適用しました")
+
+    def _current_preset_name(self) -> str:
+        """いまの設定に一致するプリセット名。どれとも違えば「手動調整」。"""
+        fx = self.cfg["effects"]
+        for name, preset in PRESETS.items():
+            if all(abs(float(fx.get(key, 0.0)) - float(value)) < 0.05
+                   for key, value in preset.items()
+                   if isinstance(value, (int, float)) and not isinstance(value, bool)):
+                return name
+        return MANUAL_PRESET
+
+    def _sync_preset_name(self) -> None:
+        name = self._current_preset_name()
+        if self.preset.GetValue() != name:
+            self.preset.SetValue(name)
 
     def _sync_denoise_mode(self) -> None:
         """効果の値から、種類の表示を合わせる。"""
@@ -1491,6 +1540,8 @@ class VoxDesk(wx.Frame):
                                     size=self.dip(280, -1))
         self.vst_list.InsertColumn(0, "名前", width=self.FromDIP(190))
         self.vst_list.InsertColumn(1, "状態", width=self.FromDIP(80))
+        self.vst_list.Bind(wx.EVT_SIZE,
+                           lambda e: (stretch_column(self.vst_list, 0), e.Skip()))
         self.vst_list.Bind(wx.EVT_LIST_ITEM_SELECTED,
                            lambda _e: self._show_vst_parameters())
         self.vst_list.Bind(wx.EVT_LIST_ITEM_ACTIVATED, lambda _e: self.open_vst_editor())
@@ -1509,10 +1560,10 @@ class VoxDesk(wx.Frame):
         emphasize(self.editor_button, 0)
         self.editor_button.Bind(wx.EVT_BUTTON, lambda _e: self.open_vst_editor())
         box.Add(self.editor_button, 0, wx.EXPAND | wx.ALL, 4)
-        note = hint_label(parent, "※ 画面は別ウィンドウで開きます。開いている間も"
-                                  "このアプリはそのまま使え、つまみを動かすと音にすぐ反映されます。")
-        note.Wrap(260)
-        box.Add(note, 0, wx.ALL, 4)
+        box.Add(wrapped_label(parent, "※ 画面は別ウィンドウで開きます。開いている間も"
+                                      "このアプリはそのまま使え、つまみを動かすと"
+                                      "音にすぐ反映されます。"),
+                0, wx.EXPAND | wx.ALL, 4)
         columns.Add(box, 0, wx.EXPAND | wx.RIGHT, 8)
 
         box, parent = boxed(tab, " パラメータ ")
@@ -2037,11 +2088,10 @@ class VoxDesk(wx.Frame):
         self.remote_url = wx.TextCtrl(parent, style=wx.TE_READONLY)
         row.Add(self.remote_url, 1, wx.ALIGN_CENTER_VERTICAL)
         box.Add(row, 0, wx.EXPAND | wx.ALL, 6)
-        remote_note = hint_label(
+        box.Add(wrapped_label(
             parent, "同じ Wi-Fi のスマホでこの住所を開くと、曲の予約・キー・歌詞・映像が"
-                    "手元で使えます（開いている間は、同じ回線の人なら誰でも操作できます）")
-        remote_note.Wrap(700)
-        box.Add(remote_note, 0, wx.LEFT | wx.BOTTOM, 6)
+                    "手元で使えます（開いている間は、同じ回線の人なら誰でも操作できます）"),
+            0, wx.LEFT | wx.BOTTOM | wx.RIGHT, 6)
         sizer.Add(box, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 8)
 
         diag = wx.BoxSizer(wx.HORIZONTAL)
@@ -2080,7 +2130,8 @@ class VoxDesk(wx.Frame):
 
         storage = wx.BoxSizer(wx.HORIZONTAL)
         self.cache_label = hint_label(tab, "作成したオフボーカル: 確認中…")
-        storage.Add(self.cache_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8)
+        # あとで長い文字に差し替わる。幅を取っておかないとボタンに重なる
+        storage.Add(self.cache_label, 1, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8)
         clear = wx.Button(tab, label="まとめて削除")
         clear.Bind(wx.EVT_BUTTON, lambda _e: self.clear_offvocal_cache())
         storage.Add(clear, 0)
@@ -2312,6 +2363,7 @@ class VoxDesk(wx.Frame):
         self.cache_label.SetLabel(
             f"作成したオフボーカル: {count} 件 / {size:.0f} MB"
             + ("" if count else "（まだありません）"))
+        self.setup_tab.Layout()  # 文字が伸びた分を並べ直す
 
     def clear_offvocal_cache(self) -> None:
         import separator

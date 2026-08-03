@@ -116,6 +116,12 @@ class Remote:
         elif action == "stop":
             app.post(app.stop_music)
         elif action == "next":
+            # 予約が空のときは何もしない。歌っている最中に押されて
+            # 曲が止まると、取り返しがつかない
+            with self._lock:
+                waiting = bool(self.queue)
+            if not waiting:
+                return {"ok": False, "error": "予約がありません"}
             app.post(self.play_next)
         elif action == "seek":
             position = float(value or 0) * (app.player.duration or 0)
