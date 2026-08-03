@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+import juce_thread
 import platform_support
 from pedalboard import (
     Compressor,
@@ -67,9 +68,13 @@ def plugin_names(path: str) -> list[str]:
     Serum2 や Reaktor のように本体とエフェクト版が同居しているものがある。
     1 つしか入っていなければ空のリストを返す。
     """
-    try:
+    def scan():
         from pedalboard import VST3Plugin
-        names = VST3Plugin.get_plugin_names_for_file(path)
+        return VST3Plugin.get_plugin_names_for_file(path)
+
+    try:
+        # 走査も JUCE を起こすので、読み込みと同じスレッドで行う
+        names = juce_thread.run(scan)
     except Exception:
         return []  # 走査できない形式もある。その場合は読み込み時のエラーから拾う
     return list(names) if names and len(names) > 1 else []
@@ -107,23 +112,30 @@ class VstSlot:
         preset_data はプラグインによって復元できないことがあるため、
         保存にはこちらを使う。
         """
-        state = {}
-        for key, param in self.plugin.parameters.items():
-            try:
-                state[key] = float(param.raw_value)
-            except Exception:
-                continue
-        return state
+        def read():
+            state = {}
+            for key, param in self.plugin.parameters.items():
+                try:
+                    state[key] = float(param.raw_value)
+                except Exception:
+                    continue
+            return state
+
+        # パラメータも JUCE 側の状態なので、読み書きは専用スレッドに任せる
+        return juce_thread.run(read)
 
     def apply_parameter_state(self, state: dict) -> None:
-        for key, value in (state or {}).items():
-            param = self.plugin.parameters.get(key)
-            if param is None:
-                continue
-            try:
-                param.raw_value = float(value)
-            except Exception:
-                continue
+        def write():
+            for key, value in (state or {}).items():
+                param = self.plugin.parameters.get(key)
+                if param is None:
+                    continue
+                try:
+                    param.raw_value = float(value)
+                except Exception:
+                    continue
+
+        juce_thread.run(write)
 
 
 class RNNoiseDenoiser:
@@ -401,8 +413,9 @@ class MicChain:
 
         1 つのファイルに複数のプラグインが入っている場合は plugin_name で選ぶ。
         """
-        plugin = load_plugin(path, plugin_name=plugin_name) if plugin_name \
-            else load_plugin(path)
+        plugin = juce_thread.run(
+            lambda: load_plugin(path, plugin_name=plugin_name) if plugin_name
+            else load_plugin(path))
         label = name or os.path.splitext(os.path.basename(path))[0]
         if plugin_name and plugin_name not in label:
             label = f"{label}（{plugin_name}）"
@@ -419,7 +432,11 @@ class MicChain:
     def remove_vst3(self, slot: VstSlot) -> None:
         if slot in self._vst:
             self._vst.remove(slot)
-            self._rebuild()
+            self._rebuild()  # 先に外す。ここでチェーン側の参照が消える
+        # 最後の参照を JUCE スレッドで捨てる（デストラクタもそこを触る）
+        holder = [slot.plugin]
+        slot.plugin = None
+        juce_thread.dispose(holder)
 
     def set_bypass(self, slot: VstSlot, bypass: bool) -> None:
         slot.bypass = bypass

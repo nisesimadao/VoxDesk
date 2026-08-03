@@ -23,6 +23,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 
 # プラグイン画面用の子プロセスは、この下の重い読み込み（numpy / 音声 / 動画）を
 # 必要としない。インストーラ版では自分自身を起動するため、ここで先に分岐して
@@ -32,6 +33,14 @@ if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "--vst-editor
 
     sys.argv = [sys.argv[0], *sys.argv[2:]]
     sys.exit(vst_editor_host.main())
+
+# ボーカル除去が使えるかの判定も、torch を画面のプロセスに持ち込まないよう
+# 別プロセスで行う（DLL の読み込みが画面を固まらせるため）。
+if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "--capability":
+    import separator
+
+    print(separator.capability_json())
+    sys.exit(0)
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -43,6 +52,7 @@ from PIL import ImageTk
 import applog
 import config
 import devices as dev
+import juce_thread
 import mic_chain
 import music_search
 import platform_support
@@ -244,6 +254,7 @@ class KaraokeApp(tk.Tk):
         self._build_mic_tab()
         self._build_vst_tab()
         self._build_setup_tab()
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
         # よく使う操作はキーでも。文字入力中は邪魔しない
         self.bind_all("<space>", self._on_space)
@@ -670,6 +681,12 @@ class KaraokeApp(tk.Tk):
         filter_entry = ttk.Entry(head, textvariable=self.param_filter_var)
         filter_entry.grid(row=0, column=1, sticky="ew", padx=8)
         filter_entry.bind("<KeyRelease>", lambda _e: self._show_vst_parameters())
+        # つまみが何十個もあるプラグインでは、全部並べると出るまでに間が空く。
+        # よく使う分だけ先に出して、残りは求められたときに出す
+        self.param_more = ttk.Button(head, text="すべて表示", width=11,
+                                     command=self._show_all_params)
+        self.param_more.grid(row=0, column=2)
+        self.param_more.grid_remove()
 
         canvas = tk.Canvas(params, highlightthickness=0, height=380)
         canvas.grid(row=1, column=0, sticky="nsew")
@@ -678,14 +695,20 @@ class KaraokeApp(tk.Tk):
         canvas.configure(yscrollcommand=scroll.set)
         self.param_frame = ttk.Frame(canvas)
         self.param_window = canvas.create_window((0, 0), window=self.param_frame, anchor="nw")
-        self.param_frame.bind(
-            "<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+        self.param_frame.bind("<Configure>", self._on_param_frame_configure)
         canvas.bind("<Configure>",
                     lambda e: canvas.itemconfigure(self.param_window, width=e.width))
         canvas.bind_all("<MouseWheel>", self._on_param_scroll)
         self.param_canvas = canvas
         self.param_rows: list[dict] = []
         self._param_dragging = False
+        # 今どのプラグインのつまみを出しているか。同じなら組み直さない
+        self._param_signature: tuple | None = None
+        self._param_build = 0
+        self._param_building = False
+        self._param_show_all = False
+        self._param_last_key = None
+        self._param_pending = False
 
         self.vst_hint = ttk.Label(params, text="プラグインを追加すると、ここでつまみを操作できます。",
                                   style="Hint.TLabel")
@@ -696,8 +719,11 @@ class KaraokeApp(tk.Tk):
         """ワーカースレッドから UI 更新を依頼する。"""
         self.ui_queue.put((func, args))
 
-    def run_async(self, work, done=None, busy_text: str = "") -> None:
-        """重い処理を別スレッドで実行し、結果をメインスレッドへ返す。"""
+    def run_async(self, work, done=None, busy_text: str = "", on_error=None) -> None:
+        """重い処理を別スレッドで実行し、結果をメインスレッドへ返す。
+
+        on_error を渡すと、失敗をそちらに任せる（既定の警告窓は出さない）。
+        """
         if busy_text:
             self._busy += 1
             self.status_label.configure(text=busy_text)
@@ -709,7 +735,7 @@ class KaraokeApp(tk.Tk):
                 error = None
             except Exception as e:  # noqa: BLE001 - 画面に出して知らせる
                 result, error = None, e
-            self.post(self._finish_async, done, result, error, bool(busy_text))
+            self.post(self._finish_async, done, result, error, bool(busy_text), on_error)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -725,7 +751,7 @@ class KaraokeApp(tk.Tk):
         except Exception:
             pass
 
-    def _finish_async(self, done, result, error, was_busy) -> None:
+    def _finish_async(self, done, result, error, was_busy, on_error=None) -> None:
         if was_busy:
             self._busy = max(0, self._busy - 1)
             if self._busy == 0:
@@ -734,6 +760,9 @@ class KaraokeApp(tk.Tk):
         if error is not None:
             # 画面には短い日本語を出しつつ、本当の中身は記録に残す
             LOG.error("処理に失敗しました", exc_info=(type(error), error, error.__traceback__))
+            if on_error is not None:
+                on_error(error)
+                return
             message = friendly_error(error)
             self.status_label.configure(text=message)
             messagebox.showerror(APP_TITLE, message)
@@ -1247,49 +1276,42 @@ class KaraokeApp(tk.Tk):
         path = dict(available_vst3()).get(name)
         if not path:
             return
-        # pedalboard は VST3 をメインスレッドで読み込む必要がある
-        #（別スレッドで作ると "must be reloaded on the main thread" で失敗する）。
-        # 読み込みは 1 秒未満なので、ここで直接行う。
-        self.status_label.configure(text=f"{name} を読み込み中…")
-        self.configure(cursor="watch")
-        self.update_idletasks()
-
+        # 走査も読み込みも JUCE 用のスレッドで行われるので、ここでは待たない。
         # 1 つのファイルに複数入っているもの（Serum2 や Reaktor など）は選ばせる
-        choice = None
-        candidates = mic_chain.plugin_names(path)
-        if candidates:
-            self.configure(cursor="")
-            choice = self.ask_choice(f"{name} には複数のプラグインが入っています",
-                                     "どれを使いますか？", candidates)
-            if choice is None:
-                self.status_label.configure(text="追加をやめました")
-                return
-            self.configure(cursor="watch")
-
-        try:
-            slot = self.chain.add_vst3(path, name, choice)
-        except Exception as e:
-            # 走査できない環境では、失敗のメッセージに候補名が並ぶ
-            fallback = mic_chain.names_from_error(str(e))
-            self.configure(cursor="")
-            if fallback:
+        def after_scan(candidates):
+            choice = None
+            if candidates:
                 choice = self.ask_choice(f"{name} には複数のプラグインが入っています",
-                                         "どれを使いますか？", fallback)
-                if choice is not None:
-                    try:
-                        slot = self.chain.add_vst3(path, name, choice)
-                        self.status_label.configure(text=f"{name} を追加しました")
-                        self._refresh_vst_rack(select=slot)
-                        return
-                    except Exception as retry_error:
-                        e = retry_error
-            messagebox.showerror(APP_TITLE, f"{name} を読み込めませんでした:\n{e}")
+                                         "どれを使いますか？", candidates)
+                if choice is None:
+                    self.status_label.configure(text="追加をやめました")
+                    return
+            self._load_vst3(name, path, choice)
+
+        self.run_async(lambda: mic_chain.plugin_names(path), after_scan,
+                       busy_text=f"{name} を調べています…")
+
+    def _load_vst3(self, name: str, path: str, choice: str | None,
+                   retried: bool = False) -> None:
+        """VST3 を読み込んでラックに足す。読み込みは別スレッドで行う。"""
+        def done(slot):
+            self.status_label.configure(text=f"{name} を追加しました")
+            self._refresh_vst_rack(select=slot)
+
+        def failed(error):
+            # 走査できない環境では、失敗のメッセージに候補名が並ぶ
+            fallback = [] if retried else mic_chain.names_from_error(str(error))
+            if fallback:
+                pick = self.ask_choice(f"{name} には複数のプラグインが入っています",
+                                       "どれを使いますか？", fallback)
+                if pick is not None:
+                    self._load_vst3(name, path, pick, retried=True)
+                    return
+            messagebox.showerror(APP_TITLE, f"{name} を読み込めませんでした:\n{error}")
             self.status_label.configure(text="読み込みに失敗しました")
-            return
-        finally:
-            self.configure(cursor="")
-        self.status_label.configure(text=f"{name} を追加しました")
-        self._refresh_vst_rack(select=slot)
+
+        self.run_async(lambda: self.chain.add_vst3(path, name, choice), done,
+                       busy_text=f"{name} を読み込んでいます…", on_error=failed)
 
     def ask_choice(self, title: str, prompt: str, options: list[str]) -> str | None:
         """選択肢から 1 つ選ばせる小さな窓。選ばれた文字列か None を返す。"""
@@ -1323,13 +1345,18 @@ class KaraokeApp(tk.Tk):
         return result["value"]
 
     def _restore_vst(self) -> None:
-        """前回の VST3 構成を戻す。読み込みはメインスレッドで行う必要がある。"""
-        self.status_label.configure(text="前回の VST3 を読み込み中…")
-        self.update_idletasks()
-        failed = self.chain.restore_vst_state(self.cfg.get("vst3", []))
-        self._refresh_vst_rack()
-        self.status_label.configure(
-            text=f"読み込めなかった VST3: {', '.join(failed)}" if failed else "準備完了")
+        """前回の VST3 構成を戻す。読み込みは JUCE 用のスレッドで行う。"""
+        saved = self.cfg.get("vst3", [])
+        if not saved:
+            return
+
+        def done(failed):
+            self._refresh_vst_rack()
+            self.status_label.configure(
+                text=f"読み込めなかった VST3: {', '.join(failed)}" if failed else "準備完了")
+
+        self.run_async(lambda: self.chain.restore_vst_state(saved), done,
+                       busy_text="前回の VST3 を読み込んでいます…")
 
     def selected_slot(self):
         selection = self.vst_tree.selection()
@@ -1489,69 +1516,211 @@ class KaraokeApp(tk.Tk):
         self._show_vst_parameters()
 
     # ---------- パラメータ操作 ----------
+    def _on_param_frame_configure(self, _event=None) -> None:
+        """つまみを収めた枠の大きさが変わったら、巻き取り範囲を計算し直す。
+
+        1 行足すたびに走ると、行数に応じてどんどん重くなる。
+        組み立て中は見送り、終わったところで 1 度だけ行う。
+        """
+        if self._param_building:
+            return
+        self.param_canvas.configure(scrollregion=self.param_canvas.bbox("all"))
+
     def _on_param_scroll(self, event) -> None:
         if self.notebook.index("current") == 2:
             self.param_canvas.yview_scroll(int(-event.delta / 120), "units")
 
+    # つまみ 1 行あたり 3 部品ある。一度に全部作ると数百ミリ秒固まるので刻む。
+    # 行数ではなく時間で区切る（部品の種類が初めて出るときだけ 1 行 30ms 級になる）
+    PARAM_BUDGET = 0.035
+
+    # 最初に出すつまみの数。これ以上は「すべて表示」を押されてから出す
+    PARAM_LIMIT = 16
+
+    def _show_all_params(self) -> None:
+        self._param_show_all = True
+        self._param_signature = None
+        self._show_vst_parameters()
+
+    VST_TAB = 2
+
+    def _on_tab_changed(self, _event=None) -> None:
+        """VST3 タブを開いたときに、先送りしていたつまみを組み立てる。"""
+        if self.notebook.index("current") == self.VST_TAB and self._param_pending:
+            self._param_pending = False
+            self._show_vst_parameters()
+
     def _show_vst_parameters(self) -> None:
+        if self.notebook.index("current") != self.VST_TAB:
+            # 見えていない画面のために時間を使わない。開かれたときに組む
+            self._param_pending = True
+            self._param_signature = None
+            return
+        slot = self.selected_slot()
+        key = slot.key if slot is not None else None
+        if key != self._param_last_key:  # 別のプラグインなら絞り込みからやり直す
+            self._param_last_key = key
+            self._param_show_all = False
+        needle = self.param_filter_var.get().strip().lower()
+        signature = (key, needle, self._param_show_all)
+        if signature == self._param_signature:
+            # 選んだ行が変わるたびに呼ばれるが、中身が同じなら組み直さない
+            return
+        self._param_signature = signature
+        self._param_build += 1  # 途中まで組みかけのものがあれば、そこで止める
+        generation = self._param_build
+
+        self._param_building = False  # 前の組み立てが途中で終わっていても戻す
         for child in self.param_frame.winfo_children():
             child.destroy()
         self.param_rows = []
 
-        slot = self.selected_slot()
         if slot is None:
+            self.param_more.grid_remove()
             self.vst_hint.configure(text="プラグインを追加すると、ここでつまみを操作できます。")
             return
 
-        needle = self.param_filter_var.get().strip().lower()
-        self.param_frame.columnconfigure(1, weight=1)
-        shown = 0
-        for key, param in slot.plugin.parameters.items():
-            if needle and needle not in key.lower():
-                continue
-            self._build_param_row(slot, key, param, shown)
-            shown += 1
-        total = len(slot.plugin.parameters)
-        self.vst_hint.configure(
-            text=f"{slot.name}: {shown}/{total} 項目を表示中"
-                 + ("（細かい調整は「プラグインの画面を開く」から）" if shown else ""))
+        self.vst_hint.configure(text=f"{slot.name}: つまみを読み込んでいます…")
+        # つまみの読み出しは JUCE スレッドで行われる。ここで待つと、
+        # 読み込み中のプラグインがあるぶんだけ画面が固まる
+        self.run_async(
+            lambda: self._param_snapshot(slot),
+            lambda snapshot: self._build_param_rows(slot, snapshot, needle, generation))
 
-    def _build_param_row(self, slot, key: str, param, row: int) -> None:
+    def _build_param_rows(self, slot, snapshot: list[dict], needle: str,
+                          generation: int) -> None:
+        """読み出した情報から、つまみの行を少しずつ組み立てる。
+
+        画面に付いたままの枠へ 1 行ずつ足すと、その都度 Tk が枠全体を
+        配置し直すので、行数が増えるほど重くなる。画面から外した枠に
+        組み立てて、出来上がってから 1 度だけ差し替える。
+        """
+        if generation != self._param_build:
+            return  # 読んでいる間に別のプラグインへ切り替わった
+        matched = [i for i in snapshot if not needle or needle in i["key"].lower()]
+        hidden = 0
+        if not self._param_show_all and len(matched) > self.PARAM_LIMIT:
+            hidden = len(matched) - self.PARAM_LIMIT
+            rows = matched[:self.PARAM_LIMIT]
+            self.param_more.configure(text=f"すべて表示（{len(matched)}）")
+            self.param_more.grid()
+        else:
+            rows = matched
+            self.param_more.grid_remove()
+
+        holder = ttk.Frame(self.param_canvas)  # まだどこにも置かない＝配置が走らない
+        holder.columnconfigure(1, weight=1)
+        self.param_frame = holder
+
+        def build(start: int) -> None:
+            if generation != self._param_build:
+                holder.destroy()
+                return  # 別のプラグインに切り替わった
+            limit = time.perf_counter() + self.PARAM_BUDGET
+            made = start
+            while made < len(rows):
+                self._build_param_row(slot, rows[made], made)
+                made += 1
+                if time.perf_counter() >= limit:
+                    break
+            self.vst_hint.configure(
+                text=f"{slot.name}: {made}/{len(snapshot)} 項目を表示中"
+                     + (f"（あと {hidden} 項目は「すべて表示」か絞り込みで）" if hidden
+                        else "（細かい調整は「プラグインの画面を開く」から）" if made else ""))
+            if made < len(rows):
+                # 1 ミリ秒だと、1 回の更新でひとつながりに処理されてしまい
+                # 刻んだ意味が無くなる。1 コマ分あけて必ず描き直しを挟む
+                self.after(16, lambda: build(made))
+                return
+            # ここで初めて画面に出す
+            old = self.param_canvas.itemcget(self.param_window, "window")
+            self.param_canvas.itemconfigure(self.param_window, window=holder)
+            holder.bind("<Configure>", self._on_param_frame_configure)
+            if old:
+                try:
+                    self.nametowidget(old).destroy()
+                except Exception:
+                    pass
+            self._param_building = False
+            self._on_param_frame_configure()
+
+        self._param_building = True
+        build(0)
+
+    @staticmethod
+    def _param_snapshot(slot) -> list[dict]:
+        """つまみの情報を JUCE スレッドでまとめて読む。
+
+        1 項目ずつ読むと、項目の数だけスレッドをまたぐ往復が起きる。
+        プラグインによっては 200 項目を超えるので、1 回にまとめる。
+        """
+        def read():
+            rows = []
+            for key, param in slot.plugin.parameters.items():
+                info = {"key": key, "param": param, "text": "", "choices": None,
+                        "min": 0.0, "max": 1.0, "raw": 0.0, "value": None}
+                for name, getter in (
+                        ("text", lambda p=param: str(p.string_value)),
+                        ("choices", lambda p=param: list(p.valid_values or [])),
+                        ("raw", lambda p=param: float(p.raw_value)),
+                        ("value", lambda k=key: getattr(slot.plugin, k))):
+                    try:
+                        info[name] = getter()
+                    except Exception:
+                        pass
+                try:
+                    info["min"], info["max"] = param.min_value, param.max_value
+                except Exception:
+                    pass
+                rows.append(info)
+            return rows
+
+        try:
+            return juce_thread.run(read)
+        except Exception:
+            return []
+
+    def _build_param_row(self, slot, info: dict, row: int) -> None:
         frame = self.param_frame
+        key, param = info["key"], info["param"]
         ttk.Label(frame, text=key.replace("_", " "), width=22).grid(
             row=row, column=0, sticky="w", pady=1)
-        value_label = ttk.Label(frame, text=self._param_text(param), width=12)
+        value_label = ttk.Label(frame, text=info["text"], width=12)
         value_label.grid(row=row, column=2, sticky="w", padx=(6, 0))
 
-        choices = getattr(param, "valid_values", None)
+        choices = info["choices"]
         entry = {"key": key, "param": param, "label": value_label, "widget": None,
                  "kind": "", "var": None, "slot": slot}
 
         if choices and isinstance(choices[0], bool):
-            var = tk.BooleanVar(value=bool(getattr(slot.plugin, key, False)))
+            var = tk.BooleanVar(value=bool(info["value"]))
             widget = ttk.Checkbutton(
                 frame, variable=var,
                 command=lambda v=var, e=entry: self._set_param(e, v.get()))
             entry.update(kind="bool", var=var, widget=widget)
         elif choices and isinstance(choices[0], str) and len(choices) <= 48:
-            var = tk.StringVar(value=str(getattr(slot.plugin, key, choices[0])))
+            current = info["value"] if info["value"] is not None else choices[0]
+            var = tk.StringVar(value=str(current))
             widget = ttk.Combobox(frame, textvariable=var, values=list(choices),
                                   state="readonly")
             widget.bind("<<ComboboxSelected>>",
                         lambda _e, v=var, en=entry: self._set_param(en, v.get()))
             entry.update(kind="enum", var=var, widget=widget)
         else:
-            lo, hi = param.min_value, param.max_value
+            lo, hi = info["min"], info["max"]
             numeric = isinstance(lo, (int, float)) and isinstance(hi, (int, float)) \
                 and not isinstance(lo, bool)
             if numeric:
-                current = float(getattr(slot.plugin, key, lo))
+                try:
+                    current = float(info["value"])
+                except (TypeError, ValueError):
+                    current = float(lo)
                 var = tk.DoubleVar(value=current)
                 kind = "float"
             else:
                 # 単位が取れないものは 0〜1 の生値で操作する（表示は文字列で出す）
                 lo, hi = 0.0, 1.0
-                var = tk.DoubleVar(value=float(param.raw_value))
+                var = tk.DoubleVar(value=info["raw"])
                 kind = "raw"
             widget = ttk.Scale(frame, from_=lo, to=hi, variable=var,
                                command=lambda _v, v=var, en=entry:
@@ -1572,22 +1741,33 @@ class KaraokeApp(tk.Tk):
 
     def _set_param(self, entry: dict, value) -> None:
         """entry が自分の所属スロットを持つので、取り違えようがない形にしている。"""
-        try:
-            if entry["kind"] == "raw":
-                entry["param"].raw_value = float(value)
-            else:
-                setattr(entry["slot"].plugin, entry["key"], value)
-        except Exception:
-            try:  # 刻みが合わない値は生値で入れ直す
-                entry["param"].raw_value = float(entry["param"].raw_value)
-            except Exception:
-                pass
-        entry["label"].configure(text=self._param_text(entry["param"]))
-        slot = entry["slot"]
-        if slot.key in self.editors:  # 開いているエディタにも反映して食い違わせない
+        def apply():
             try:
-                self._send_to_editor(slot, "set",
-                                     {entry["key"]: float(entry["param"].raw_value)})
+                if entry["kind"] == "raw":
+                    entry["param"].raw_value = float(value)
+                else:
+                    setattr(entry["slot"].plugin, entry["key"], value)
+            except Exception:
+                try:  # 刻みが合わない値は生値で入れ直す
+                    entry["param"].raw_value = float(entry["param"].raw_value)
+                except Exception:
+                    pass
+            # 反映後の見た目と生値を、同じ往復のうちに読んで持ち帰る
+            try:
+                return self._param_text(entry["param"]), float(entry["param"].raw_value)
+            except Exception:
+                return "", None
+
+        try:
+            text, raw = juce_thread.run(apply)
+        except Exception:
+            return
+        entry["label"].configure(text=text)
+        slot = entry["slot"]
+        if raw is not None and slot.key in self.editors:
+            # 開いているエディタにも反映して食い違わせない
+            try:
+                self._send_to_editor(slot, "set", {entry["key"]: raw})
             except Exception:
                 pass
 
@@ -1595,20 +1775,40 @@ class KaraokeApp(tk.Tk):
         """プラグイン本体の画面で動かされた値を表示に反映する。"""
         if self._param_dragging or not self.param_rows:
             return
-        for entry in self.param_rows:
-            param, var, kind = entry["param"], entry["var"], entry["kind"]
-            entry["label"].configure(text=self._param_text(param))
-            if var is None:
+        if juce_thread.busy():
+            # 読み込みなどで塞がっている間は見送る（待つと画面が固まる）
+            return
+        rows = list(self.param_rows)
+
+        def read():
+            out = []
+            for entry in rows:
+                param, kind = entry["param"], entry["kind"]
+                item = {"text": self._param_text(param), "current": None}
+                try:
+                    if kind == "raw":
+                        item["current"] = float(param.raw_value)
+                    elif kind == "float":
+                        item["current"] = float(getattr(entry["slot"].plugin, entry["key"]))
+                    elif kind == "bool":
+                        item["current"] = bool(getattr(entry["slot"].plugin, entry["key"]))
+                    else:
+                        item["current"] = str(getattr(entry["slot"].plugin, entry["key"]))
+                except Exception:
+                    pass
+                out.append(item)
+            return out
+
+        try:
+            values = juce_thread.run(read)
+        except Exception:
+            return
+        for entry, item in zip(rows, values):
+            entry["label"].configure(text=item["text"])
+            var, current = entry["var"], item["current"]
+            if var is None or current is None:
                 continue
             try:
-                if kind == "raw":
-                    current = float(param.raw_value)
-                elif kind == "float":
-                    current = float(getattr(entry["slot"].plugin, entry["key"]))
-                elif kind == "bool":
-                    current = bool(getattr(entry["slot"].plugin, entry["key"]))
-                else:
-                    current = str(getattr(entry["slot"].plugin, entry["key"]))
                 if isinstance(current, float):
                     if abs(float(var.get()) - current) > 1e-4:
                         var.set(current)
@@ -1675,10 +1875,14 @@ class KaraokeApp(tk.Tk):
 
     # ---------- ボーカル除去 ----------
     def _check_separator(self) -> None:
-        """使える環境かを調べる。torch の読み込みが重いので裏で行う。"""
+        """使える環境かを調べる。
+
+        torch を読むと、その DLL 読み込みが Windows のローダーロックを握り、
+        別スレッドで行っても画面が 0.5 秒ほど固まる。別プロセスに任せる。
+        """
         def work():
             import separator
-            return separator.capability()
+            return separator.capability_in_subprocess()
 
         self.run_async(work, self._apply_separator_capability)
 

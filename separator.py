@@ -25,7 +25,10 @@ from dataclasses import dataclass
 import av
 import numpy as np
 
+import applog
 import platform_support
+
+LOG = applog.get(__name__)
 
 MIN_VRAM_GB = 4.0     # これ未満の GPU では分離させない
 MIN_RAM_GB = 8.0
@@ -161,6 +164,44 @@ def hardware_probe() -> Hardware:
                         reason=f"メモリが足りません"
                                f"（{ram:.1f} GB / {MIN_RAM_GB:.0f} GB 以上必要）")
     return Hardware(kind="cuda", gpu_name=gpu, vram_gb=vram, ram_gb=ram, eligible=True)
+
+
+def capability_in_subprocess(timeout: float = 120.0) -> Capability:
+    """判定を別プロセスで行う。
+
+    torch を読むと、その DLL 読み込みが Windows のローダーロックを握り、
+    別スレッドで行っても画面が 0.5 秒ほど固まる。画面のあるプロセスでは
+    torch に触らず、結果だけを受け取る。
+    """
+    import json
+
+    if getattr(sys, "frozen", False):
+        command = [sys.executable, "--capability"]
+    else:
+        command = [sys.executable, os.path.abspath(__file__), "--capability"]
+    try:
+        proc = subprocess.run(
+            command, capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=timeout,
+            creationflags=subprocess.CREATE_NO_WINDOW if platform_support.WINDOWS else 0,
+        )
+        payload = json.loads((proc.stdout or "").strip().splitlines()[-1])
+    except Exception as e:
+        LOG.warning("別プロセスでの判定に失敗しました: %s", e)
+        return capability()  # 最後の手段として同じプロセスで調べる
+    return Capability(**payload)
+
+
+def capability_json() -> str:
+    """別プロセス側で呼ばれる入口。判定結果を 1 行の JSON で返す。"""
+    import json
+
+    cap = capability()
+    return json.dumps({
+        "available": cap.available, "reason": cap.reason, "device": cap.device,
+        "gpu_name": cap.gpu_name, "vram_gb": cap.vram_gb, "model": cap.model,
+        "installable": cap.installable,
+    })
 
 
 def capability(refresh: bool = False) -> Capability:
@@ -315,7 +356,7 @@ def separate(source: str, progress=None, keep_vocals: bool = False,
 
     if progress:
         progress("モデルを読み込み中", 0.05)
-    model = _load_model(name)
+    model = _load_model(name, cap.device)
 
     if progress:
         progress("音声を読み込み中", 0.15)
@@ -376,3 +417,9 @@ def clear_cache() -> int:
         except OSError:
             pass
     return removed
+
+
+if __name__ == "__main__":
+    # 画面のあるプロセスから呼ばれる判定用の入口（torch をそちらで読ませないため）
+    if "--capability" in sys.argv:
+        print(capability_json())
