@@ -2285,35 +2285,52 @@ class VoxDesk(wx.Frame):
         import model_installer
 
         cap = self.separator_capability
-        if cap is None or not getattr(cap, "installable", False):
+        if cap is None or cap.available:
             return
-        if not self.ask("ボーカル除去に使う部品（PyTorch と Demucs）を取得します。\n"
-                        f"およそ {model_installer.DOWNLOAD_SIZE_GB:.1f} GB "
-                        "のダウンロードが必要です。\n\n続けますか？"):
+        if not self.ask(
+                "AI によるボーカル除去を有効にします。\n\n"
+                f"　使う機器: {cap.gpu_name}\n"
+                f"　取得する量: 約 {model_installer.APPROX_TOTAL_MB / 1000:.0f} GB\n"
+                "　かかる時間: 回線によって 5〜30 分ほど\n\n"
+                "この間もアプリは使えます。始めますか？"):
             return
+
+        import separator
+
+        self._install_cancel = threading.Event()
         self.vocal_progress.Show()
+        self.vocal_progress.SetValue(0)
+        self.vocal_setup_button.Enable(False)
         self.setup_tab.Layout()
 
-        def report(stage: str, ratio: float) -> None:
-            wx.CallAfter(self._report_install, stage, ratio)
+        def report(stage: str, ratio: float, detail: str = "") -> None:
+            wx.CallAfter(self._report_install, stage, ratio, detail)
 
-        def done(_result):
+        def work():
+            model_installer.install(progress=report, cancel=self._install_cancel)
+            return separator.capability(refresh=True)
+
+        def done(cap_after):
             self.vocal_progress.Hide()
             self.setup_tab.Layout()
-            self._check_separator()
+            self._apply_separator_capability(cap_after)
+            self.set_status("ボーカル除去が使えるようになりました"
+                            if cap_after.available else cap_after.reason)
 
         def failed(error):
             self.vocal_progress.Hide()
+            self.vocal_setup_button.Enable(True)
             self.setup_tab.Layout()
             wx.MessageBox(f"取得できませんでした:\n{error}", APP_TITLE,
                           wx.OK | wx.ICON_ERROR, self)
 
-        self.run_async(lambda: model_installer.install(progress=report), done,
-                       busy_text="ボーカル除去の部品を取得しています…", on_error=failed)
+        self.run_async(work, done, busy_text="ボーカル除去の準備をしています…",
+                       on_error=failed)
 
-    def _report_install(self, stage: str, ratio: float) -> None:
+    def _report_install(self, stage: str, ratio: float, detail: str = "") -> None:
         self.vocal_progress.SetValue(int(max(0.0, min(1.0, ratio)) * 100))
-        self.set_status(f"{stage}… {ratio*100:.0f}%")
+        self.vocal_setup_label.SetLabel(f"{stage}… {detail}" if detail else f"{stage}…")
+        self.set_status(f"ボーカル除去の準備: {stage} {ratio*100:.0f}%")
 
     def remove_vocals(self) -> None:
         """いま選んでいる曲からボーカルを消す。"""
@@ -2460,8 +2477,26 @@ class VoxDesk(wx.Frame):
         self.Destroy()
 
 
+class VoxDeskApp(wx.App):
+    """画面の処理で起きた例外を、消さずに記録へ残すための入れ物。
+
+    既定では標準エラーへ出るだけで、インストーラ版には端末が無いので
+    消えてしまう。「押しても何も起きない」の原因が追えなくなる。
+    """
+
+    def OnExceptionInMainLoop(self) -> bool:
+        LOG.error("画面の処理で例外", exc_info=True)
+        frame = self.GetTopWindow()
+        if frame is not None:
+            try:
+                frame.set_status(f"問題が起きました（{sys.exc_info()[0].__name__}）")
+            except Exception:
+                pass
+        return True  # 落とさずに続ける
+
+
 def main() -> None:
-    app = wx.App(False)
+    app = VoxDeskApp(False)
     VoxDesk()
     app.MainLoop()
 

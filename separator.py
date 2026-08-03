@@ -39,12 +39,9 @@ FAST_MODEL = "htdemucs"
 HQ_MODEL = "htdemucs_ft"
 
 CACHE_DIR = os.path.join(platform_support.cache_dir(), "offvocal")
-# あとから入れた torch / demucs の置き場所。インストーラ版には site-packages が
-# 無いので、書き込める場所へ入れて読み込み先に足す。
-RUNTIME_DIR = os.path.join(platform_support.app_data_dir(), "runtime")
-
-if os.path.isdir(RUNTIME_DIR) and RUNTIME_DIR not in sys.path:
-    sys.path.insert(0, RUNTIME_DIR)
+# あとから入れた torch / demucs の置き場所（読み込み先への追加は
+# platform_support が行う。ここも同じ場所を指す）
+RUNTIME_DIR = platform_support.RUNTIME_DIR
 
 
 @dataclass

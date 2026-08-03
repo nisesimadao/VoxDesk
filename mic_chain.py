@@ -155,12 +155,24 @@ class RNNoiseDenoiser:
     _load_error = ""
 
     @classmethod
+    def reset(cls) -> None:
+        """「入っていない」の記憶を捨てて、もう一度探し直せるようにする。
+
+        設定から取得したあとに呼ぶ。これが無いと、取得できたのに
+        起動し直すまで「入っていません」と言い続けることになる。
+        """
+        cls._module = None
+        cls._load_error = ""
+
+    @classmethod
     def _binding(cls):
         if cls._module is not None or cls._load_error:
             return cls._module
         try:
             import importlib.util
 
+            platform_support.use_runtime_dir()  # 後から入れた分もここで拾う
+            importlib.invalidate_caches()  # 直前に置かれたものを見落とさない
             spec = importlib.util.find_spec("pyrnnoise")
             if spec is None or not spec.submodule_search_locations:
                 raise ImportError("pyrnnoise が入っていません")

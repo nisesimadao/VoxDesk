@@ -169,8 +169,12 @@ def install_rnnoise(progress=None) -> None:
     command = [python, "-m", "pip", "install", "--upgrade", "--no-deps",
                "--target", target_dir(), "--disable-pip-version-check", "pyrnnoise"]
     _run_pip(command, "RNNoise を取得中", progress, threading.Event(), base=0.0, span=1.0)
-    if target_dir() not in sys.path:
-        sys.path.insert(0, target_dir())
+    platform_support.use_runtime_dir()
+    # 「入っていない」と一度でも判定していると、その結果を覚えている。
+    # 捨てておかないと、取得できたのに起動し直すまで使えない
+    import mic_chain
+
+    mic_chain.RNNoiseDenoiser.reset()
 
 
 def uninstall() -> int:

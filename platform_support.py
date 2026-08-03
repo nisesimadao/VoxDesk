@@ -162,3 +162,19 @@ def launcher_hint() -> str:
     if WINDOWS:
         return "VoxDesk を起動.bat をダブルクリックしてください"
     return "./start.sh を実行してください"
+
+
+# あとから入れた部品（RNNoise / torch / demucs）の置き場。
+# インストーラ版には site-packages が無いので、書き込める場所へ入れて
+# 読み込み先に足す。ここは全部のモジュールが読むので、1 か所で済ませる。
+RUNTIME_DIR = os.path.join(app_data_dir(), "runtime")
+
+
+def use_runtime_dir() -> str:
+    """取得した部品の置き場を、読み込み先に入れる（何度呼んでも安全）。"""
+    if os.path.isdir(RUNTIME_DIR) and RUNTIME_DIR not in sys.path:
+        sys.path.insert(0, RUNTIME_DIR)
+    return RUNTIME_DIR
+
+
+use_runtime_dir()
