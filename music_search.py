@@ -8,7 +8,15 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from yt_dlp import YoutubeDL
+
+def YoutubeDL(*args, **kwargs):
+    """yt-dlp を必要になった時だけ読む。
+
+    起動時に読むと 0.2 秒ほど窓が出るのが遅れる。曲を探すまでは要らない。
+    """
+    from yt_dlp import YoutubeDL as _YoutubeDL
+
+    return _YoutubeDL(*args, **kwargs)
 
 # タイトルに含まれるとオフボーカルらしいキーワード（語, 加点）
 POSITIVE = [

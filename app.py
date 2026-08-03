@@ -191,7 +191,10 @@ class KaraokeApp(tk.Tk):
         self._set_icon()
         self._build_ui()
         self._apply_effects_from_config()
-        self._reload_devices()
+        # 機器の一覧は音声の土台の初期化を伴い、初回だけ 0.4 秒ほどかかる。
+        # 窓を先に出してから読むことで、待たされている感じを無くす。
+        self.update_idletasks()
+        self.after(30, self._reload_devices)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.after(30, self._tick)
         if self.cfg.get("vst3"):
@@ -251,6 +254,10 @@ class KaraokeApp(tk.Tk):
         bar.pack(fill="x", padx=10, pady=6)
         self.status_label = ttk.Label(bar, text="準備完了", style="Hint.TLabel")
         self.status_label.pack(side="left")
+        # 待たされている間、動いていることが目で分かるようにする
+        self.busy_bar = ttk.Progressbar(bar, mode="indeterminate", length=110)
+        self.busy_bar.pack(side="left", padx=8)
+        self.busy_bar.pack_forget()
         self.mic_state_label = ttk.Label(bar, text="マイク: 停止中", style="Hint.TLabel")
         self.mic_state_label.pack(side="right")
 
@@ -562,8 +569,9 @@ class KaraokeApp(tk.Tk):
         diag = ttk.Frame(tab)
         diag.grid(row=1, column=0, sticky="ew", pady=(12, 4))
         ttk.Label(diag, text="機器の状態", style="Head.TLabel").pack(side="left")
-        ttk.Button(diag, text="すべて調べる", command=self.run_diagnostics).pack(
-            side="left", padx=8)
+        self.diag_button = ttk.Button(diag, text="すべて調べる",
+                                      command=self.run_diagnostics)
+        self.diag_button.pack(side="left", padx=8)
         ttk.Button(diag, text="機器を再検出", command=self.rescan_devices).pack(side="left")
         ttk.Button(diag, text="選んだものを使う", command=self.use_diagnosed_device).pack(
             side="left", padx=8)
@@ -693,6 +701,7 @@ class KaraokeApp(tk.Tk):
         if busy_text:
             self._busy += 1
             self.status_label.configure(text=busy_text)
+            self._set_busy(True)
 
         def worker():
             try:
@@ -704,11 +713,24 @@ class KaraokeApp(tk.Tk):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _set_busy(self, busy: bool) -> None:
+        """待ち時間の間だけ、動いていることが分かる表示を出す。"""
+        try:
+            if busy:
+                self.busy_bar.pack(side="left", padx=8)
+                self.busy_bar.start(12)
+            else:
+                self.busy_bar.stop()
+                self.busy_bar.pack_forget()
+        except Exception:
+            pass
+
     def _finish_async(self, done, result, error, was_busy) -> None:
         if was_busy:
             self._busy = max(0, self._busy - 1)
             if self._busy == 0:
                 self.status_label.configure(text="準備完了")
+                self._set_busy(False)
         if error is not None:
             # 画面には短い日本語を出しつつ、本当の中身は記録に残す
             LOG.error("処理に失敗しました", exc_info=(type(error), error, error.__traceback__))
@@ -792,20 +814,80 @@ class KaraokeApp(tk.Tk):
         messagebox.showinfo(APP_TITLE, "\n".join(lines))
 
     def run_diagnostics(self) -> None:
-        api = self._api_filter()
-        inputs = dev.list_devices("input", api)
-        outputs = dev.list_devices("output", api)
+        """機器を 1 台ずつ調べて、終わったものから表に出す。
 
-        def work():
-            status = dev.system_status()
-            rows = []
-            for device in inputs + outputs:
-                health = dev.check(device, seconds=0.8, timeout=5.0)
-                rows.append((device, health, dev.system_hint(device, status)))
-            return rows
+        全部終わってから出すと、機器の数だけ待たされて画面が
+        止まったように見える（35 台なら 30 秒近く無反応）。
+        """
+        if getattr(self, "_diag_running", False):
+            self._diag_cancel = True
+            return
+        api = self._api_filter()
+        targets = dev.list_devices("input", api) + dev.list_devices("output", api)
+        if not targets:
+            return
 
         self.diag_tree.delete(*self.diag_tree.get_children())
-        self.run_async(work, self._show_diagnostics, busy_text="デバイスを診断中…（少し待ってください）")
+        self._diag_running = True
+        self._diag_cancel = False
+        self._diag_rows = {}
+        self._diag_status = None
+        self.diag_button.configure(text="中止する")
+        self.status_label.configure(text=f"機器を確認中… 0/{len(targets)} 台")
+
+        def load_status():
+            # OS 側の設定を読むのは 2 秒ほどかかる。機器の確認より先に置くと
+            # 最初の 1 台が出るまで無反応に見えるので、並行して取って後から埋める。
+            try:
+                status = dev.system_status()
+            except Exception:
+                status = {}
+            self.post(self._fill_diagnostic_hints, status)
+
+        def work():
+            for index, device in enumerate(targets, start=1):
+                if self._diag_cancel:
+                    break
+                health = dev.check(device, seconds=0.5, timeout=4.0)
+                status = self._diag_status
+                hint = dev.system_hint(device, status) if status else ""
+                self.post(self._add_diagnostic_row, device, health, hint,
+                          index, len(targets))
+            self.post(self._finish_diagnostics, len(targets))
+
+        threading.Thread(target=load_status, daemon=True).start()
+        threading.Thread(target=work, daemon=True).start()
+
+    def _add_diagnostic_row(self, device, health, hint, index: int, total: int) -> None:
+        item = self.diag_tree.insert(
+            "", "end",
+            values=("入力" if device.is_input else "出力",
+                    f"{device.name} [{device.hostapi}]", health.summary, hint or "—"))
+        self._diag_rows[item] = device
+        self.diag_tree.see(item)
+        self.status_label.configure(text=f"機器を確認中… {index}/{total} 台")
+
+    def _fill_diagnostic_hints(self, status: dict) -> None:
+        """OS 側の設定が読めたら、すでに出ている行の「OS 側の設定」欄を埋める。"""
+        self._diag_status = status
+        if not status:
+            return
+        for item, device in self._diag_rows.items():
+            hint = dev.system_hint(device, status)
+            if not hint or not self.diag_tree.exists(item):
+                continue
+            values = list(self.diag_tree.item(item)["values"])
+            values[3] = hint
+            self.diag_tree.item(item, values=values)
+
+    def _finish_diagnostics(self, total: int) -> None:
+        self._diag_running = False
+        self.diag_button.configure(text="すべて調べる")
+        rows = self.diag_tree.get_children()
+        usable = sum(1 for row in rows
+                     if str(self.diag_tree.item(row)["values"][2]).startswith("○"))
+        self.status_label.configure(
+            text=f"確認おわり: {len(rows)}/{total} 台を調べて {usable} 台が使えます")
 
     def use_diagnosed_device(self) -> None:
         """診断の表で選んだ機器を、そのまま設定に反映する。
@@ -827,17 +909,6 @@ class KaraokeApp(tk.Tk):
         self._on_device_change()
         self.status_label.configure(text=f"{kind}を「{target.name}」にしました")
         self.notebook.select(1)
-
-    def _show_diagnostics(self, rows) -> None:
-        self.diag_tree.delete(*self.diag_tree.get_children())
-        for device, health, hint in rows:
-            self.diag_tree.insert(
-                "", "end",
-                values=("入力" if device.is_input else "出力",
-                        f"{device.name} [{device.hostapi}]", health.summary, hint or "—"),
-            )
-        usable = sum(1 for _, h, _ in rows if h.ok and h.receives_audio is not False)
-        self.status_label.configure(text=f"診断完了: {usable}/{len(rows)} 個が使えます")
 
     def auto_setup(self) -> None:
         """実際に音が来ているマイクと、開ける出力先を選ぶ。"""

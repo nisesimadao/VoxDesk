@@ -18,10 +18,20 @@ import time
 
 import numpy as np
 import sounddevice as sd
-from scipy import signal
 
 import platform_support
 from comutil import com_initialized
+
+
+def _signal():
+    """scipy.signal を必要になった時だけ読む。
+
+    起動時に読むと 0.8 秒ほど窓が出るのが遅れる。実際に使うのは
+    ダウンサンプル時のローパスだけなので、そこまで引き延ばす。
+    """
+    from scipy import signal
+
+    return signal
 
 
 class Resampler:
@@ -41,10 +51,13 @@ class Resampler:
         self._tail = np.zeros((1, self.channels), dtype=np.float32)
 
         self._sos = None
+        self._sosfilt = None
         if out_rate < in_rate:
+            signal = _signal()
             nyq = 0.5 * in_rate
             cutoff = 0.45 * out_rate
             self._sos = signal.butter(6, cutoff / nyq, btype="low", output="sos")
+            self._sosfilt = signal.sosfilt
             # チャンネルごとに状態を持たせる（混ざると位相が崩れる）
             base = signal.sosfilt_zi(self._sos)
             self._zi = np.zeros((base.shape[0], base.shape[1], self.channels))
@@ -53,7 +66,7 @@ class Resampler:
         mono_in = x.ndim == 1
         frames = x.reshape(-1, 1) if mono_in else x
         if self._sos is not None:
-            frames, self._zi = signal.sosfilt(self._sos, frames, axis=0, zi=self._zi)
+            frames, self._zi = self._sosfilt(self._sos, frames, axis=0, zi=self._zi)
             frames = frames.astype(np.float32)
 
         y = self._interpolate(frames)
