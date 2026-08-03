@@ -404,8 +404,15 @@ class VoxDesk(wx.Frame):
         threading.Thread(target=worker, daemon=True).start()
 
     def _set_busy(self, busy: bool) -> None:
+        """待たせている間だけ、動いていることが目で分かる帯を出す。
+
+        wx の帯は Tk と違って勝手には動かない。Pulse() を呼んで初めて
+        流れ出すので、出した時点で 1 回、そのあとも定期的に叩く。
+        """
         self.busy_bar.Show(busy)
-        if not busy:
+        if busy:
+            self.busy_bar.Pulse()
+        else:
             self.busy_bar.SetValue(0)
         self.busy_bar.GetContainingSizer().Layout()
 
@@ -2415,6 +2422,9 @@ class VoxDesk(wx.Frame):
             self.video.show_image(image)
 
         self._tick_count += 1
+        if self._busy and self._tick_count % 4 == 0:
+            # 待たせている間、帯を流し続ける（Windows 以外は叩き続けが要る）
+            self.busy_bar.Pulse()
         if self._tick_count % 2 or not self._ready:  # 以下は 30Hz で十分
             return
 
