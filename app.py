@@ -751,7 +751,7 @@ class KaraokeApp(tk.Tk):
     def rescan_devices(self) -> None:
         was_running = self.router.running
         self.router.stop()
-        self.player.stop()
+        self.player.stop(wait=False)
         dev.refresh()
         self._reload_devices()
         self.status_label.configure(text="機器を再検出しました")
@@ -1767,7 +1767,7 @@ class KaraokeApp(tk.Tk):
                 path = music_search.download(track.id, folder, max_height=480)
             return separator.separate(path, progress=report)
 
-        self.player.stop()
+        self.player.stop(wait=False)
         self.run_async(work, self._play_separated,
                        busy_text="ボーカルを消しています…（GPU で処理中）")
 
@@ -1919,7 +1919,7 @@ class KaraokeApp(tk.Tk):
         out = self.selected_device("output")
         quality = int(self.cfg.get("video_quality", 720))
         self.current_local_path = None
-        self.player.stop()
+        self.player.stop(wait=False)
         self.music_status.configure(text="読み込み中…")
 
         def work():
@@ -2028,7 +2028,7 @@ class KaraokeApp(tk.Tk):
             self.apply_key_to_current()
             return
         out = self.selected_device("output")
-        self.player.stop()
+        self.player.stop(wait=False)
         self._photo = None
         self.player.set_display_size(max(2, self.video_frame.winfo_width()),
                                      max(2, self.video_frame.winfo_height()))
@@ -2081,7 +2081,7 @@ class KaraokeApp(tk.Tk):
         out = self.selected_device("output")
         quality = int(self.cfg.get("video_quality", 720))
 
-        self.player.stop()
+        self.player.stop(wait=False)
         self.music_status.configure(text=f"読み込み中: {track.title}")
         self.run_async(
             lambda: music_search.resolve(track.id, max_height=quality),
@@ -2174,7 +2174,7 @@ class KaraokeApp(tk.Tk):
             rendered = pitch_render.render(local, key, progress=report) if key else local
             return local, rendered
 
-        self.player.stop()
+        self.player.stop(wait=False)
         self.run_async(work, lambda r: self._play_with_key(*r, position),
                        busy_text=f"キー {key:+d} を準備しています…")
 
@@ -2204,7 +2204,7 @@ class KaraokeApp(tk.Tk):
             self.after(1200, lambda: self.player.seek(position))
 
     def stop_music(self, message: str = "停止しました") -> None:
-        self.player.stop()
+        self.player.stop(wait=False)
         self.video_label.configure(image="", text="ここに映像が出ます")
         self._photo = None
         self.position_var.set(0)
@@ -2327,7 +2327,7 @@ class KaraokeApp(tk.Tk):
         self.cfg["vst3"] = self.chain.vst_state()
         config.save(self.cfg)
         self.close_vst_editor()  # 開いたままのプラグイン画面を残さない
-        self.player.stop()
+        self.player.stop(wait=False)
         self.router.stop()
         self.destroy()
 

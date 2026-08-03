@@ -110,7 +110,7 @@ class AVPlayer:
              headers: dict | None = None, device: int | None = None,
              duration: float | None = None) -> None:
         """再生を開始する。ネットワーク待ちがあるので実処理は別スレッドで行う。"""
-        self.stop()
+        self.stop(wait=False)  # 前の曲の後片付けを待つと、切り替えが固まって見える
         self._stop_evt = threading.Event()
         self.duration = duration
         self.state = "opening"
@@ -210,24 +210,37 @@ class AVPlayer:
             except Exception:
                 pass
 
-    def stop(self) -> None:
+    def stop(self, wait: bool = True) -> None:
+        """再生を止める。
+
+        wait=False なら後片付けの完了を待たずに戻る。デコードスレッドは
+        通信待ちで数百ミリ秒〜数秒抜けてこないことがあり、画面の操作から
+        呼ぶときに待つと、その間ずっと固まって見える。
+        待たなくても、各スレッドは自分の停止合図を見て終わり、
+        自分が開いたコンテナも自分で閉じる。
+        """
         self._stop_evt.set()
-        if self._stream is not None:
-            try:
-                self._stream.stop()
-                self._stream.close()
-            except Exception:
-                pass
-            self._stream = None
-        # コンテナはそれを使っているデコードスレッド自身が閉じる。
-        # ここで閉じると、まだ読んでいるスレッドが解放済みメモリを触って落ちる。
-        for t in list(self._threads):
-            if t is not threading.current_thread():
-                t.join(timeout=2.0)
+        stream, self._stream = self._stream, None
+        threads = [t for t in self._threads if t is not threading.current_thread()]
         self._threads.clear()
         self._containers.clear()
         self._drain(self._video_q)
         self._drain(self._audio_q)
+
+        def finish() -> None:
+            if stream is not None:
+                try:
+                    stream.stop()
+                    stream.close()
+                except Exception:
+                    pass
+            for t in threads:
+                t.join(timeout=5.0)
+
+        if wait:
+            finish()
+        else:
+            threading.Thread(target=finish, daemon=True).start()
         self._cur_audio = None
         self._clock = 0.0
         self._wall_base = None
