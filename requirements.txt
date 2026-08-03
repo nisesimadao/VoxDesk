@@ -1,3 +1,5 @@
+# 画面。OS 本物の部品を使う（Windows なら Win32 のコントロールがそのまま出る）
+wxPython>=4.2
 # 音声の入出力とリアルタイム処理
 sounddevice>=0.5
 numpy>=1.26

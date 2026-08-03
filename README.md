@@ -81,7 +81,7 @@ Windows は `VoxDesk を起動.bat`、macOS / Linux は `chmod +x start.sh && ./
 .\build.ps1         # Windows
 ```
 
-Python・tkinter・PortAudio の有無を確かめ、仮想環境を作り、
+Python・PortAudio の有無を確かめ、仮想環境を作り、
 アイコンを生成して、`dist/` に一式を出す。
 macOS なら dmg、Linux なら tar.gz、Windows は Inno Setup があればインストーラまで作る。
 版を付けたいときは `./build.sh 1.2.0` のように渡す。

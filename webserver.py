@@ -136,10 +136,8 @@ class Remote:
             self.app.change_key(delta)
 
     def _set_volume(self, volume: float) -> None:
-        volume = max(0.0, min(1.5, volume))
-        self.app.cfg["music_volume"] = volume
-        self.app.music_volume_var.set(volume)
-        self.app.player.volume = volume
+        # 画面側にも反映させたいので、つまみの実装は本体に任せる
+        self.app.set_music_volume(max(0.0, min(1.5, volume)))
 
     # ---------- 予約 ----------
     def enqueue(self, video_id: str, title: str) -> dict:

@@ -34,7 +34,7 @@ hiddenimports += [
     "vst_editor_host", "sounddevice", "applog", "config", "comutil", "devices",
     "lyrics", "mic_chain", "model_installer", "music_search", "pitch_render",
     "platform_support", "player", "ranking", "router", "separator",
-    "juce_thread", "webserver",
+    "juce_thread", "webserver", "wxui", "tkui", "uicommon",
 ]
 
 # アイコンと、スマホ用リモコンの画面

@@ -27,14 +27,10 @@ command -v "$PYTHON" >/dev/null 2>&1 || die "python3 が見つかりません。
     || die "Python 3.10 以上が必要です（今: $("$PYTHON" -V)）"
 echo "  $("$PYTHON" -V) / $OS $ARCH"
 
-if ! "$PYTHON" -c "import tkinter" >/dev/null 2>&1; then
-    echo "tkinter が入っていません。次で入れてください:" >&2
-    case "$OS" in
-        Darwin) echo "  brew install python-tk" >&2 ;;
-        Linux)  echo "  sudo apt install python3-tk     (Debian/Ubuntu)" >&2
-                echo "  sudo dnf install python3-tkinter (Fedora)" >&2 ;;
-    esac
-    exit 1
+# 画面は wxPython。Linux では GTK を先に入れておかないと wheel が組めない
+if [ "$OS" = "Linux" ] && ! pkg-config --exists gtk+-3.0 2>/dev/null; then
+    echo "警告: GTK3 が見つかりません。wxPython の用意に失敗するかもしれません。" >&2
+    echo "  sudo apt install libgtk-3-dev   (Debian/Ubuntu)" >&2
 fi
 
 if [ "$OS" = "Linux" ] && ! ldconfig -p 2>/dev/null | grep -q libportaudio; then
