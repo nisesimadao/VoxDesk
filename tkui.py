@@ -2538,9 +2538,12 @@ class KaraokeApp(tk.Tk):
 
         # 映像。大きさが同じなら貼り替えるだけで済ませる
         #（作り直しは何倍も重く、GUI 全体が固まる原因になる）
-        image = self.player.take_frame()
-        if image is not None:
-            self.last_frame = image  # リモコンへ流す用（貼り替えでは変化しない）
+        array = self.player.take_frame()
+        if array is not None:
+            self.last_frame = array  # リモコンへ流す用（貼り替えでは変化しない）
+            # 再生側は生データで渡してくる。Tk は画像でないと貼れない
+            from PIL import Image
+            image = Image.fromarray(array, "RGB")
             if self._photo is None or self._photo.width() != image.width or \
                     self._photo.height() != image.height:
                 # 表示中の画像をその場で捨てると、描画途中の Tk が

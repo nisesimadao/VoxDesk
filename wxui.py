@@ -135,16 +135,18 @@ class VideoView(wx.Panel):
         self.SetBackgroundStyle(wx.BG_STYLE_PAINT)  # ちらつきを防ぐ
         self.Bind(wx.EVT_PAINT, self._on_paint)
 
-    def show_image(self, image) -> None:
-        """PIL の画像を受け取って描き直す。
+    def show_frame(self, array) -> None:
+        """(高さ, 幅, 3) の生データを受け取って、その場で描く。
 
-        再生側は rgb24 で渡してくるので、そのまま渡せる。念のため他の
-        形式なら直すが、毎コマ変換すると 1 枚まるごと複製することになる。
+        Refresh() で塗り直しに任せると、毎コマ 1562x533 の裏紙を用意して
+        全面を黒で塗ってから絵を載せることになる。絵で埋まらない縁だけを
+        塗り、絵は直接転送する。
         """
-        if image.mode != "RGB":
-            image = image.convert("RGB")
-        self._bitmap = wx.Bitmap(wx.Image(image.width, image.height, image.tobytes()))
-        self.Refresh(eraseBackground=False)
+        height, width = array.shape[0], array.shape[1]
+        self._bitmap = wx.Bitmap.FromBuffer(width, height, array)
+        self._message = ""
+        dc = wx.ClientDC(self)
+        self._draw(dc, clear_all=False)
 
     def clear(self, message: str = "ここに映像が出ます") -> None:
         self._bitmap = None
@@ -152,18 +154,37 @@ class VideoView(wx.Panel):
         self.Refresh()
 
     def _on_paint(self, _event) -> None:
-        dc = wx.AutoBufferedPaintDC(self)
-        dc.SetBackground(wx.Brush(DARK))
-        dc.Clear()
+        self._draw(wx.AutoBufferedPaintDC(self), clear_all=True)
+
+    def _draw(self, dc, clear_all: bool) -> None:
         width, height = self.GetClientSize()
-        if self._bitmap is not None:
-            x = (width - self._bitmap.GetWidth()) // 2
-            y = (height - self._bitmap.GetHeight()) // 2
-            dc.DrawBitmap(self._bitmap, max(0, x), max(0, y), False)
+        if self._bitmap is None:
+            dc.SetBackground(wx.Brush(DARK))
+            dc.Clear()
+            if self._message:
+                dc.SetTextForeground(HINT)
+                text_width, text_height = dc.GetTextExtent(self._message)
+                dc.DrawText(self._message, (width - text_width) // 2,
+                            (height - text_height) // 2)
             return
-        dc.SetTextForeground(HINT)
-        text_width, text_height = dc.GetTextExtent(self._message)
-        dc.DrawText(self._message, (width - text_width) // 2, (height - text_height) // 2)
+
+        image_width, image_height = self._bitmap.GetWidth(), self._bitmap.GetHeight()
+        x = max(0, (width - image_width) // 2)
+        y = max(0, (height - image_height) // 2)
+        if clear_all:
+            dc.SetBackground(wx.Brush(DARK))
+            dc.Clear()
+        else:
+            # 絵で埋まらない縁だけを塗る。全面を塗ると、その分だけ毎コマ無駄
+            dc.SetPen(wx.TRANSPARENT_PEN)
+            dc.SetBrush(wx.Brush(DARK))
+            if y > 0:
+                dc.DrawRectangle(0, 0, width, y)
+                dc.DrawRectangle(0, y + image_height, width, height - y - image_height)
+            if x > 0:
+                dc.DrawRectangle(0, y, x, image_height)
+                dc.DrawRectangle(x + image_width, y, width - x - image_width, image_height)
+        dc.DrawBitmap(self._bitmap, x, y, False)
 
 
 def hint_label(parent, text: str = "") -> wx.StaticText:
@@ -281,6 +302,8 @@ class VoxDesk(wx.Frame):
         self._param_last_key = None
         self._param_pending = False
         self._param_dragging = False
+        self._key_timer = None  # ♯♭ の連打をまとめるための待ち
+        self._key_job = 0       # 途中でキーが変わったら古い結果は捨てる
 
         self._ready = False
         self._set_icon()
@@ -728,6 +751,10 @@ class VoxDesk(wx.Frame):
         self._refresh_transport()
 
     # ---------- キー ----------
+    # ♯♭ は続けて押されることが多い。1 回ごとに作り直すと、そのたびに
+    # 曲が止まる。押し終わるのを少し待ってから、最後のキーだけ用意する
+    KEY_DELAY = 600
+
     def change_key(self, delta: int) -> None:
         """伴奏のキーを半音単位で上げ下げする。
 
@@ -743,22 +770,32 @@ class VoxDesk(wx.Frame):
             self.music_status.SetLabel(
                 f"キー {value:+d} で次から再生します" if value else "キーを元に戻しました")
             return
-        self.apply_key_to_current()
+        if self._key_timer is not None:
+            self._key_timer.Stop()
+        self._key_timer = wx.CallLater(self.KEY_DELAY, self.apply_key_to_current)
+        self.music_status.SetLabel(f"キー {value:+d} を準備します…（このまま歌えます）")
 
     def apply_key_to_current(self) -> None:
-        """いま鳴っている曲に、選んだキーを適用し直す。"""
+        """いま鳴っている曲に、選んだキーを適用し直す。
+
+        用意ができるまで曲は止めない。止めてから作ると、作っている間ずっと
+        無音になり、作り置きが効いている場合でも開き直すぶんだけ待たされる。
+        """
         import pitch_render
 
+        self._key_timer = None
         key = int(self.cfg.get("pitch_semitones", 0))
-        position = self.player.position
         track = self.current_track
         source = self.current_local_path
         if source is None and track is None:
             return
+        self._key_job += 1
+        job = self._key_job
 
         def report(stage: str, ratio: float) -> None:
             wx.CallAfter(self.music_status.SetLabel,
-                         f"キー {key:+d} を準備中: {stage}… {ratio*100:.0f}%")
+                         f"キー {key:+d} を準備中: {stage}… {ratio*100:.0f}%"
+                         "（このまま歌えます）")
 
         def work():
             local = source
@@ -770,9 +807,13 @@ class VoxDesk(wx.Frame):
             rendered = pitch_render.render(local, key, progress=report) if key else local
             return local, rendered
 
-        self.player.stop(wait=False)
-        self.run_async(work, lambda r: self._play_with_key(*r, position),
-                       busy_text=f"キー {key:+d} を準備しています…")
+        def done(result):
+            if job != self._key_job:
+                return  # 待っている間にまたキーが変わった
+            # 差し替える直前の位置から続ける
+            self._play_with_key(*result, self.player.position)
+
+        self.run_async(work, done, busy_text=f"キー {key:+d} を準備しています…")
 
     def _play_with_key(self, source: str, rendered: str, position: float) -> None:
         """映像は元のまま、音声だけ差し替えて再生する。"""
@@ -780,6 +821,7 @@ class VoxDesk(wx.Frame):
         device = out.index if out else None
         self.current_local_path = source
         has_video = source.lower().endswith(self.VIDEO_EXTENSIONS)
+        self.player.stop(wait=False)  # ここで初めて止める
 
         if rendered == source:
             self.player.open(source, None, {}, device=device)
@@ -795,8 +837,21 @@ class VoxDesk(wx.Frame):
         self.play_button.SetLabel("⏸ 一時停止")
         title = self.current_track.title if self.current_track else name
         self.request_lyrics(title, self.player.duration)
-        if position > 1.0:  # 元の位置から続ける
-            wx.CallLater(1200, lambda: self.player.seek(position))
+        if position > 1.0:
+            self._seek_when_ready(position, time.monotonic())
+
+    def _seek_when_ready(self, position: float, started: float) -> None:
+        """開き終わった時点で、元の位置へ飛ばす。
+
+        決め打ちで 1.2 秒待つと、その分だけ余計に無音が伸びる。
+        鳴り出したらすぐ飛ばす。
+        """
+        if self.player.state == "playing":
+            self.player.seek(position)
+            return
+        if self.player.state == "error" or time.monotonic() - started > 8.0:
+            return
+        wx.CallLater(60, lambda: self._seek_when_ready(position, started))
 
     # ---------- 歌詞 ----------
     def request_lyrics(self, title: str, duration: float | None) -> None:
@@ -820,8 +875,16 @@ class VoxDesk(wx.Frame):
             import lyrics
             return lyrics.best_match(title, duration)
 
+        def failed(error):
+            # 歌詞はおまけなので、取れなくても歌の邪魔をしない。
+            # 窓を出して「ネットを確認してください」と言うと、
+            # 実際には繋がっているのに疑わせることになる
+            LOG.info("歌詞を取得できませんでした: %s", error)
+            self.lyric_status.SetLabel(
+                "歌詞は出せませんでした（「曲を指定」で探せます）")
+
         self.lyric_status.SetLabel("歌詞を探しています…")
-        self.run_async(work, done)
+        self.run_async(work, done, on_error=failed)
 
     def _hide_lyrics(self) -> None:
         self.lyric_now.SetLabel("")
@@ -2419,7 +2482,7 @@ class VoxDesk(wx.Frame):
         image = self.player.take_frame()
         if image is not None:
             self.last_frame = image  # リモコンへ流す用
-            self.video.show_image(image)
+            self.video.show_frame(image)
 
         self._tick_count += 1
         if self._busy and self._tick_count % 4 == 0:

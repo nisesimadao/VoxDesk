@@ -41,6 +41,15 @@ MJPEG_FPS = 12
 MJPEG_QUALITY = 70
 
 
+def _image(frame):
+    """再生側から来た絵を、JPEG にできる形にする。"""
+    from PIL import Image
+
+    if hasattr(frame, "shape"):  # (高さ, 幅, 3) の生データ
+        return Image.fromarray(frame, "RGB")
+    return frame.convert("RGB")  # 以前の画面（Tk 版）は画像で渡してくる
+
+
 def lan_address() -> str:
     """同じネットワークの端末から見た、この PC の住所を返す。
 
@@ -370,11 +379,13 @@ class _Handler(BaseHTTPRequestHandler):
         interval = 1.0 / MJPEG_FPS
         last_id = None
         while not self.server.stopping:
-            image = getattr(self.remote.app, "last_frame", None)
-            if image is not None and id(image) != last_id:
-                last_id = id(image)
+            frame = getattr(self.remote.app, "last_frame", None)
+            if frame is not None and id(frame) != last_id:
+                last_id = id(frame)
                 buffer = io.BytesIO()
-                image.convert("RGB").save(buffer, "JPEG", quality=MJPEG_QUALITY)
+                # 再生側は (高さ, 幅, 3) の生データで渡してくる。
+                # JPEG にするのはここだけなので、この場で画像にする
+                _image(frame).save(buffer, "JPEG", quality=MJPEG_QUALITY)
                 data = buffer.getvalue()
                 self.wfile.write(
                     f"--{boundary}\r\nContent-Type: image/jpeg\r\n"

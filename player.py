@@ -414,8 +414,16 @@ class AVPlayer:
         self.video_size = (frame.width, frame.height)
         box_w, box_h = self._display_size
         w, h = _fit(frame.width, frame.height, box_w, box_h)
-        image = frame.reformat(width=w, height=h, format="rgb24").to_image()
-        self._put(self._video_q, (gen, pts, image), gen)
+        # PIL を通すと、画面へ出すまでにもう 1 回まるごと複製することになる
+        #（1562x533 で 2.3ms/枚）。並びだけの生データで渡す。
+        # FFmpeg は行の端に詰め物を入れるので、隙間の無い形に直してから渡す
+        #（このままでは画面側がそのまま受け取れない）
+        # 縮小しかしないので AREA（画素をまとめて平均する）。既定の
+        # bicubic より 1 枚あたり 3.2ms 速く、縮小の見た目もこちらが良い
+        array = np.ascontiguousarray(
+            frame.reformat(width=w, height=h, format="rgb24",
+                           interpolation="AREA").to_ndarray())
+        self._put(self._video_q, (gen, pts, array), gen)
 
     def _push_audio(self, frame, resampler, gen: int) -> None:
         for rf in resampler.resample(frame):
@@ -482,7 +490,10 @@ class AVPlayer:
 
     # ---------- 表示（メインスレッドから呼ぶ） ----------
     def take_frame(self):
-        """再生位置に達した映像フレームを返す。無ければ None。"""
+        """再生位置に達した映像フレームを返す。無ければ None。
+
+        (高さ, 幅, 3) の uint8（rgb24）。そのまま画面に渡せる形にしてある。
+        """
         clock = self.position
         image = None
         q = self._video_q

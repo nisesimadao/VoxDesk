@@ -148,7 +148,9 @@ def _request(path: str, params: dict) -> object:
         else:
             raise RuntimeError(f"歌詞を取得できませんでした（{e.code}）") from e
     except Exception as e:
-        raise RuntimeError("歌詞を取得できませんでした（ネットの接続を確認してください）") from e
+        # ここは歌詞の置き場に届かなかっただけ。利用者のネットが切れて
+        # いるとは限らない（相手側の不調や締め出しもある）ので、そう書く
+        raise RuntimeError(f"歌詞の配信元につながりませんでした（{type(e).__name__}）") from e
     _cache[url] = (time.time(), data)
     return data
 
