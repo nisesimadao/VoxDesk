@@ -2604,7 +2604,20 @@ class KaraokeApp(tk.Tk):
         self.close_vst_editor()  # 開いたままのプラグイン画面を残さない
         self.player.stop(wait=False)
         self.router.stop()
+        applog.closing()
         self.destroy()
+
+    def report_callback_exception(self, exc_type, exc, tb) -> None:
+        """画面の操作中に起きた例外を、消さずに記録へ残す。
+
+        Tk は既定でこれを標準エラーへ出すが、インストーラ版には端末が
+        無いので消えてしまい、「急に落ちた」の理由が追えなくなる。
+        """
+        LOG.error("画面の処理で例外", exc_info=(exc_type, exc, tb))
+        try:
+            self.status_label.configure(text=f"問題が起きました（{exc_type.__name__}）")
+        except Exception:
+            pass
 
 
 def main() -> None:
